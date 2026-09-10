@@ -64,6 +64,36 @@ def synthesize_segments(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     default_wav = speaker_wavs.get(None) or next(iter(speaker_wavs.values()))
+
+    # Chatterbox's alignment analyzer crashes on very short utterances (its
+    # reduction window ends up empty). Merge tiny fragments into the next
+    # segment from the same speaker so no words are lost and nothing stutters.
+    _MIN_CHARS = 3
+    merged: list[Segment] = []
+    carry = ""
+    carry_speaker = None
+    for seg in segments:
+        text = (seg.translated or seg.text).strip()
+        if carry and seg.speaker == carry_speaker:
+            text = f"{carry} {text}".strip()
+            carry = ""
+            carry_speaker = None
+        if len(text.rstrip(".,!?…")) < _MIN_CHARS:
+            carry = text
+            carry_speaker = seg.speaker
+            continue
+        merged.append(seg.with_translation(text))
+    if carry:
+        for i in range(len(merged) - 1, -1, -1):
+            if merged[i].speaker == carry_speaker:
+                prev = (merged[i].translated or merged[i].text).strip()
+                merged[i] = merged[i].with_translation(f"{prev} {carry}")
+                carry = ""
+                break
+        if carry:
+            log.info(f"Dropping trailing fragment too short to synthesize: {carry!r}")
+    segments = merged
+
     out: list[Segment] = []
     for seg in segments:
         text = seg.translated or seg.text
@@ -73,7 +103,7 @@ def synthesize_segments(
             tts.synthesize(text, speaker_wav, language, clip)
             out.append(seg.with_audio(clip))
         except Exception as exc:
-            log.error(f"TTS failed for segment {seg.index} ({text[:40]!r}): {exc}")
+            log.exception(f"TTS failed for segment {seg.index} ({text[:40]!r}): {exc}")
             out.append(seg)
     log.success(f"Synthesized {sum(s.audio_path is not None for s in out)}/{len(out)} segments")
     return out

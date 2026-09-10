@@ -1,0 +1,32 @@
+# Terms that must never be translated.
+# One per line. Lines starting with # are ignored.
+# Edit freely - no need to touch any code.
+
+# --- identity / channel ---
+Atlas
+Atlas Baudelaire
+Bro Town
+
+# --- games / platforms ---
+Rec Room
+TSW
+FiveM
+GTA
+Roblox
+Minecraft
+
+# --- in-game terms ---
+tokens
+Rec Room Tokens
+
+# --- rail terms that should stay English ---
+CrossCountry
+West Midlands Railway
+Great Western Railway
+GWR
+
+# --- platforms ---
+YouTube
+Discord
+Twitch
+Steam

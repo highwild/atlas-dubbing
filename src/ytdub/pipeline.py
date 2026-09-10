@@ -165,18 +165,36 @@ def dub(source: str, settings: Settings | None = None) -> DubResult:
 
     # 7. Combine video + dubbed audio. With lip-sync on, Wav2Lip re-renders the mouth
     #    to match the new speech; otherwise we just swap the audio track.
-    out_path = settings.output_dir / f"{dl.video_id}.{target}.mp4"
-    if settings.lipsync:
-        from ytdub.ffmpeg import faststart_remux
-        from ytdub.stages.lipsync import lipsync
+    # detect whether the source actually has a video stream
+    import subprocess as _sp
+    _probe = _sp.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+         str(dl.video_path)],
+        capture_output=True, text=True,
+    )
+    _has_video = "video" in _probe.stdout
 
-        raw = work / "lipsynced.mp4"
-        lipsync(dl.video_path, dubbed_audio, raw)
-        faststart_remux(raw, out_path)  # make it share-ready (WhatsApp)
+    if not _has_video:
+        # audio-only source: no muxing, just publish the dubbed audio
+        out_path = settings.output_dir / f"{dl.video_id}.{target}.wav"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        import shutil as _shutil
+        _shutil.copy2(dubbed_audio, out_path)
+        log.success(f"Audio-only source: wrote {out_path.name}")
     else:
-        assemble.assemble(
-            dl.video_path, dubbed_audio, out_path, reencode_video=settings.reencode_video
-        )
+        out_path = settings.output_dir / f"{dl.video_id}.{target}.mp4"
+        if settings.lipsync:
+            from ytdub.ffmpeg import faststart_remux
+            from ytdub.stages.lipsync import lipsync
+
+            raw = work / "lipsynced.mp4"
+            lipsync(dl.video_path, dubbed_audio, raw)
+            faststart_remux(raw, out_path)  # make it share-ready (WhatsApp)
+        else:
+            assemble.assemble(
+                dl.video_path, dubbed_audio, out_path, reencode_video=settings.reencode_video
+            )
 
     # 8. Translated subtitles sidecar (handy for review and sharing).
     srt_path = settings.output_dir / f"{dl.video_id}.{target}.srt"

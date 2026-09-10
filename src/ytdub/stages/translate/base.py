@@ -43,7 +43,13 @@ def get_translator(name: str) -> Translator:
         from ytdub.stages.translate.nllb import NllbTranslator
 
         return NllbTranslator()
-    raise ValueError(f"Unknown translator backend: {name!r} (expected 'argos' or 'nllb')")
+    if name == "ollama":
+        from ytdub.stages.translate.ollama import OllamaTranslator
+
+        return OllamaTranslator()
+    raise ValueError(
+        f"Unknown translator backend: {name!r} (expected 'argos', 'nllb' or 'ollama')"
+    )
 
 
 def translate_segments(

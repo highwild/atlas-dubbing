@@ -72,9 +72,12 @@ def download(
         ),
         "merge_output_format": "mp4",
         "outtmpl": outtmpl,
-        "quiet": True,
+        "quiet": False,
         "no_warnings": True,
         "noprogress": True,
+        "source_address": "0.0.0.0",
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
         **cookie_opts,
     }
 
@@ -100,8 +103,12 @@ def download(
         ],
         # 16 kHz mono is what Whisper/cloning models expect.
         "postprocessor_args": {"extractaudio": ["-ar", "16000", "-ac", "1"]},
+        "source_address": "0.0.0.0",
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
         **cookie_opts,
     }
+
     log.info("Extracting 16 kHz mono audio track")
     with yt_dlp.YoutubeDL(audio_opts) as ydl:
         ydl.extract_info(url, download=True)
