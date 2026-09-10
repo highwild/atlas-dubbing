@@ -54,6 +54,19 @@ class Match:
     merged: list[str]  # other labels that also match this clip
 
 
+def embed_fn(device: str = "cpu"):
+    """A one-argument embedder, keeping the encoder alive only as long as it is used.
+
+    ``embed_file`` needs an encoder, and building one per clip would load the model again
+    each time. The returned callable owns it; drop the callable (or call ``release``) when
+    the comparison is done.
+    """
+    from resemblyzer import VoiceEncoder
+
+    encoder = VoiceEncoder(device)
+    return lambda path: embed_file(path, encoder)
+
+
 def voice_clips(path: Path) -> list[Path]:
     """The audio files at ``path``: the file itself, or every audio file in the folder."""
     if path.is_dir():

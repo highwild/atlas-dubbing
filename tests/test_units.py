@@ -5,6 +5,7 @@ network hardening and the CLI."""
 from __future__ import annotations
 
 import socket
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -70,15 +71,63 @@ def test_short_fragment_merges_into_same_speaker_neighbour():
     assert stuck == []
 
 
-def test_fragment_never_merges_across_speakers_or_big_gaps():
+def test_fragment_never_merges_across_speakers():
+    """Putting your word into someone else's mouth is worse than any timing fault."""
+    from ytdub.stages.tts.base import merge_short_fragments
+
+    segs = [seg(0, 0, 2, translated="Pierwsza osoba", speaker="SPK0"),
+            seg(1, 2.1, 2.3, translated="No!", speaker="SPK1"),
+            seg(2, 2.5, 5, translated="Znowu pierwsza", speaker="SPK0")]
+    merged, unspoken = merge_short_fragments(segs, min_chars=3, max_gap=1.5)
+    assert [m.speech_text for m in merged] == ["Pierwsza osoba", "No!", "Znowu pierwsza"]
+    assert unspoken == [], "it is still spoken — alone, in its own voice"
+
+
+def test_a_one_word_line_near_a_line_of_its_speaker_is_spoken_with_it():
+    """The last resort, and the reason it exists: a one-word line handed to the
+    synthesizer alone either crashes it (IndexError, or a device-side assert that poisons
+    the CUDA context) or loops into a multi-second clip. Saying it early, in the right
+    voice, is the least bad option left."""
+    from ytdub.stages.tts.base import merge_short_fragments
+
+    segs = [seg(0, 0, 2, translated="Pierwsza osoba", speaker="SPK0"),
+            seg(1, 2.1, 2.3, translated="No!", speaker="SPK1"),
+            seg(2, 2.5, 5, translated="Znowu pierwsza", speaker="SPK0"),
+            seg(3, 7.0, 7.2, translated="ok", speaker="SPK0")]
+    merged, unspoken = merge_short_fragments(segs, min_chars=3, max_gap=1.5, stuck_gap=3.0)
+    assert unspoken == [], "the cross-speaker line is still refused a home, and spoken alone"
+    assert [m.speech_text for m in merged] == ["Pierwsza osoba", "No!", "Znowu pierwsza ok"]
+    # It is spoken in the target line's window, not in a span stretching across the gap:
+    # a window from 2.5s to 6.2s would block everything said in between.
+    # Spoken in the target line's window, not in a span stretching to the fragment's own:
+    # 2.5s to 7.2s would block everything said in between.
+    assert (merged[-1].start, merged[-1].end) == (2.5, 5.0)
+    assert merged[-1].sources == [2, 3]
+
+
+def test_a_lone_word_with_no_line_of_its_speaker_near_it_is_not_spoken():
+    """Handing it to the model alone is what crashed, or looped, every time it happened.
+    One word of audio is cheaper than any of those outcomes, and the line is reported."""
     from ytdub.stages.tts.base import merge_short_fragments
 
     segs = [seg(0, 0, 2, translated="Pierwsza osoba", speaker="SPK0"),
             seg(1, 2.1, 2.3, translated="No!", speaker="SPK1"),
             seg(2, 2.5, 5, translated="Znowu pierwsza", speaker="SPK0"),
             seg(3, 9.0, 9.2, translated="ok", speaker="SPK0")]
-    merged, stuck = merge_short_fragments(segs, min_chars=3, max_gap=1.5)
-    assert len(merged) == 4 and sorted(stuck) == [1, 3]
+    merged, unspoken = merge_short_fragments(segs, min_chars=3, max_gap=1.5, stuck_gap=3.0)
+    assert unspoken == [3], "the lone word is the line that goes unspoken"
+    assert len(merged) == 3, "the cross-speaker word is still spoken, alone"
+    assert not any(m.speech_text.endswith("ok") for m in merged)
+
+
+def test_a_phrase_with_no_neighbour_is_still_spoken_alone():
+    """Only a lone word is fatal. A short phrase is left to the synthesizer, as before."""
+    from ytdub.stages.tts.base import merge_short_fragments
+
+    segs = [seg(0, 0, 2, translated="Pierwsza osoba", speaker="SPK0"),
+            seg(1, 9.0, 9.4, translated="do widzenia", speaker="SPK0")]
+    merged, unspoken = merge_short_fragments(segs, min_chars=3, max_gap=1.5, stuck_gap=3.0)
+    assert unspoken == [] and len(merged) == 2
 
 
 def test_a_single_word_is_a_fragment_however_many_letters_it_has():
@@ -114,8 +163,8 @@ def test_a_one_word_line_still_never_crosses_speakers():
     segs = [seg(0, 0, 2, translated="Pierwsza osoba", speaker="SPK0"),
             seg(1, 2.1, 2.6, translated="Tanguy", speaker="SPK1"),
             seg(2, 2.8, 5, translated="Znowu pierwsza", speaker="SPK0")]
-    merged, stuck = merge_short_fragments(segs, min_chars=3)
-    assert len(merged) == 3 and stuck == [1]
+    merged, unspoken = merge_short_fragments(segs, min_chars=3)
+    assert len(merged) == 3 and unspoken == []
 
 
 def test_fragment_merges_forward_when_it_opens_a_turn():
@@ -417,3 +466,41 @@ def test_sticky_cuda_faults_are_told_apart_from_recoverable_ones():
     assert not is_cuda_lost(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
     assert not is_cuda_lost(RuntimeError("simulated TTS crash"))
     assert not is_cuda_lost(ValueError("nope"))
+
+
+def test_hindi_gets_its_own_character_budget():
+    """Measured on tangi.wav: the synthesizer speaks 6.6 Hindi characters per second where
+    Spanish manages 8.2, so the shared 15 asked for twice the text a Hindi slot holds and
+    the fitter compressed to its 3x cap — a fast-forward, not speech."""
+    from ytdub.config import Settings
+    from ytdub.models import Source
+    from ytdub.pipeline import Job
+    from ytdub.stages.translate.prompt import budget_chars
+
+    settings = Settings(_env_file=None, chars_per_second=15.0,
+                        chars_per_second_by_language={"hi": 12.0})
+    job = Job.__new__(Job)
+    job.s = settings
+    job.segments = [seg(0, 0.0, 4.0), seg(1, 4.0, 8.0)]
+    job.src = Source(path=Path("/tmp/x.wav"), basename="x", sha256="x", duration=10.0,
+                     has_video=False)
+    default = job._budgets()
+    hindi = job._budgets_for("hi", default)
+    spanish = job._budgets_for("es", default)
+    assert spanish == default, "a language with no measured rate is untouched"
+    assert hindi[0] == budget_chars(4.0, 12.0) < default[0]
+    assert all(h < d for h, d in zip(hindi, default))
+
+
+def test_a_configured_rate_of_zero_leaves_the_budget_alone():
+    from ytdub.config import Settings
+    from ytdub.models import Source
+    from ytdub.pipeline import Job
+
+    job = Job.__new__(Job)
+    job.s = Settings(_env_file=None, chars_per_second_by_language={"hi": 0})
+    job.segments = [seg(0, 0.0, 4.0)]
+    job.src = Source(path=Path("/tmp/x.wav"), basename="x", sha256="x", duration=10.0,
+                     has_video=False)
+    default = job._budgets()
+    assert job._budgets_for("hi", default) == default

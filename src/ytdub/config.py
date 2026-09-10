@@ -127,6 +127,16 @@ class Settings(BaseSettings):
     translate_context_lines: int = 4  # already-translated lines shown before a batch
     translate_lookahead_lines: int = 3  # source lines shown after a batch
     chars_per_second: float = 15.0
+    # Some languages need more time per character than the Latin default allows, and the
+    # budget is what decides how long the translation may be. Hindi is the measured case:
+    # over a whole run of tangi.wav, the synthesizer spoke 6.6 Hindi characters per second
+    # of audio where Spanish managed 8.2 and Dutch 9.4, so a budget of 15 asked for roughly
+    # twice the text its slot could hold and the fitter compressed the result to the 3x cap
+    # (47 of 84 segments compressed, 9 over the cap — audibly a fast-forward). 12 is the
+    # value that puts Hindi in the same range as the others. "lang: cps" pairs, e.g.
+    # {"hi": 12.0}; anything not listed uses chars_per_second.
+    chars_per_second_by_language: dict[str, float] = Field(
+        default_factory=lambda: {"hi": 12.0})
     budget_max_borrow: float = 2.0  # seconds of following silence a budget may include
     budget_tolerance: float = 1.15  # re-request lines longer than budget x this
     budget_retries: int = 2
@@ -165,6 +175,11 @@ class Settings(BaseSettings):
     # shorter than this in spoken characters, or when it is a single word (see
     # stages/tts/base.py: one-word lines are what crash the synthesizer).
     min_tts_chars: int = 3
+    # How far a one-word line may be moved to be spoken with a line of its own speaker.
+    # Further than this it is left unspoken and reported: a lone word is what makes the
+    # synthesizer crash (host-side IndexError, or a device-side assert that poisons the
+    # CUDA context) or loop into a multi-second clip for a two-letter line.
+    tts_stuck_gap: float = 3.0
     merge_max_gap: float = 1.5  # only merge into a neighbour this close in time
     # Write digits out as words for the synthesizer only ("7,8" -> "siedem przecinek
     # osiem"). The SRT keeps the digits; see stages/numbers.py for what is left alone.

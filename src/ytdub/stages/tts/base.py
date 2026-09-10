@@ -102,18 +102,29 @@ def is_fragment(seg: Segment, min_chars: int) -> bool:
 
 
 def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
-                          max_gap: float = 1.5) -> tuple[list[Segment], list[int]]:
+                          max_gap: float = 1.5, stuck_gap: float = 3.0
+                          ) -> tuple[list[Segment], list[int]]:
     """Merge fragment lines into a neighbour; see :func:`is_fragment` for what counts.
 
     Merging preserves the words, adds no stutter and also frees a little timeline, which
     is strictly better than the alternatives: a crash, or a line padded with punctuation
     that does not help.
 
-    Only an *adjacent* segment of the *same* speaker within ``max_gap`` seconds is a
-    valid target (preferring the previous one), so speech order is never changed. A
-    fragment with no such neighbour is left alone and reported — merging it across a
-    speaker, or across a long silence, would move the words somewhere they were not said.
-    Returns ``(segments, unmergeable_indices)``.
+    Three rounds, in order of preference:
+
+    1. Into an adjacent line of the same speaker within ``max_gap`` (preferring the
+       previous one), so speech order is never changed.
+    2. A *one-word* line with nobody that near goes to the nearest line of its own speaker
+       within ``stuck_gap``. Said a couple of seconds off, in the right voice, beats the
+       two things that otherwise happen: the synthesizer dies on it, or it comes back as a
+       six-second clip for a two-letter word and wrecks the timing around it.
+    3. A one-word line with no line of its own speaker anywhere near it is **not spoken**.
+       Its index comes back in the second element, and the caller reports it as a lost
+       line. Nothing is gained by handing it to the model alone: that is the case that
+       crashed, or looped, every time.
+
+    Anything else too short to be safe is left in place and synthesized alone, as before.
+    Returns ``(segments, unspoken_indices)``.
     """
     segs = [replace(s, sources=s.sources or [s.index]) for s in segments]
 
@@ -128,6 +139,13 @@ def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
             confidence=min(confs) if confs else None, sources=a.sources + b.sources,
         )
 
+    def absorb(i: int, target: int) -> None:
+        """Merge ``segs[i]`` into ``segs[target]``, keeping speech order."""
+        if target < i:
+            segs[target:i + 1] = [merged(segs[target], segs[i])]
+        else:
+            segs[i:target + 1] = [merged(segs[i], segs[target])]
+
     stuck: set[int] = set()
     changed = True
     while changed:
@@ -136,20 +154,73 @@ def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
             if not is_fragment(seg, min_chars) or seg.sources[0] in stuck:
                 continue
             if i > 0 and joinable(segs[i - 1], seg):
-                segs[i - 1:i + 1] = [merged(segs[i - 1], seg)]
+                absorb(i, i - 1)
             elif i + 1 < len(segs) and joinable(seg, segs[i + 1]):
-                segs[i:i + 2] = [merged(seg, segs[i + 1])]
+                absorb(i, i + 1)
             else:
                 stuck.add(seg.sources[0])
                 continue
             changed = True
             break
+    # Still stuck, and a single word: a line the model cannot say on its own. Speak it with
+    # the nearest line of the same speaker, however far away that is. Being said slightly
+    # early or late is a small fault; the alternatives are a crash inside the synthesizer,
+    # a multi-second clip for a two-letter word, or a word that is never spoken at all.
+    unspoken: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for i, seg in enumerate(segs):
+            if seg.sources[0] not in stuck or seg.sources[0] in unspoken:
+                continue
+            if len(seg.speech_text.split()) > 1:
+                continue  # a phrase is not fatal on its own; only a lone word is
+            others = [j for j, other in enumerate(segs)
+                      if j != i and other.speaker == seg.speaker]
+            if not others:
+                continue
+            j = min(others, key=lambda k: _time_gap(seg, segs[k]))
+            if _time_gap(seg, segs[j]) > stuck_gap:
+                # Nowhere near a line of its own speaker, and this is one word: do not
+                # speak it. See rule 3 in the docstring.
+                unspoken.add(seg.sources[0])
+                continue
+            first, second = (i, j) if i < j else (j, i)
+            joined = merged(segs[first], segs[second])
+            # The words are spoken in the *target's* window, whatever the fragment's own
+            # was. A span stretched from one to the other would block every line between
+            # them from being placed anywhere near where it was said.
+            segs[j] = replace(joined, start=segs[j].start, end=segs[j].end)
+            del segs[i]
+            stuck.discard(seg.sources[0])
+            log.info(f"one-word line {seg.index} had no same-speaker neighbour to merge "
+                     f"into; speaking it with line {segs[j].index} of the same speaker "
+                     "instead (a word said early beats one not said)")
+            changed = True
+            break
+    left_alone = sorted(stuck - unspoken)
+    if left_alone:
+        # Short, but not a lone word: a phrase the model can say on its own.
+        log.warning(f"{len(left_alone)} short fragment(s) have no same-speaker neighbour "
+                    f"to merge into (lines {left_alone}); synthesizing them alone")
+    if unspoken:
+        segs = [seg for seg in segs if seg.sources[0] not in unspoken]
     for i, seg in enumerate(segs):
         seg.index = i
     for seg in segs:
         if len(seg.sources) > 1:
             log.info(f"merged short fragment(s) into line {seg.index}: {seg.speech_text!r}")
-    return segs, sorted(stuck)
+    if unspoken:
+        log.error(f"{len(unspoken)} one-word line(s) have no line of the same speaker "
+                  f"within {stuck_gap:.1f}s and are not spoken: {sorted(unspoken)}. A lone "
+                  "word is what makes the synthesizer crash or loop; merge it with a "
+                  "neighbour in the review SRT to get it into the dub.")
+    return segs, sorted(unspoken)
+
+
+def _time_gap(a: Segment, b: Segment) -> float:
+    """Seconds of silence between two segments; 0 if they touch or overlap."""
+    return max(b.start - a.end, a.start - b.end, 0.0)
 
 
 def spoken_text(text: str, language: str, *, expand_numbers: bool,

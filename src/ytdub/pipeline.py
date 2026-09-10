@@ -236,6 +236,9 @@ class Job:
             self.segments = diarize.diarize_embedding(self.asr_wav, segs,
                                                       num_speakers=self.s.speakers,
                                                       device=self.s.device)
+        # A tiny island of lines between one dominant speaker is a split, and it is worth
+        # removing before anything downstream sees it. In the key, because it changes the
+        # labels the key is supposed to stand for.
         if self.s.speaker_map.strip():
             # Applied *before* the result is cached and before the key is used by anything
             # downstream: an out-of-band override that the key does not see would let a
@@ -329,6 +332,28 @@ class Job:
                              max_borrow=self.s.budget_max_borrow)
         return [budget_chars(sl, self.s.chars_per_second) for sl in slots]
 
+    def _budgets_for(self, lang: str, default: list[int]) -> list[int]:
+        """Per-language character budgets, when that language measures differently.
+
+        A budget is a promise about how long the translation may be, and it is only as good
+        as the speaking rate behind it. Hindi through this synthesizer needs about 6.6
+        characters per second where Spanish needs 8.2, so the shared 15 asked for nearly
+        twice the text a Hindi slot holds; the fitter then compressed to its 3x cap and the
+        result was unintelligible. See ``chars_per_second_by_language``.
+        """
+        rate = self.s.chars_per_second_by_language.get(lang)
+        if rate is None or rate <= 0 or rate == self.s.chars_per_second:
+            return default
+        from ytdub.stages.fit import budget_slots
+        from ytdub.stages.translate.prompt import budget_chars
+
+        slots = budget_slots([s.start for s in self.segments], [s.end for s in self.segments],
+                             self.src.duration, min_gap=self.s.min_gap,
+                             max_borrow=self.s.budget_max_borrow)
+        log.info(f"[{lang}] speaking rate {rate:g} chars/sec (not "
+                 f"{self.s.chars_per_second:g}); character budgets adjusted")
+        return [budget_chars(slot, rate) for slot in slots]
+
     def _style_and_glossary(self) -> tuple[str, list[str], str, str]:
         from ytdub.stages.translate.prompt import load_glossary, load_style
 
@@ -401,7 +426,7 @@ class Job:
         from ytdub.stages.translate import Line, get_translator
 
         style, glossary, style_raw, gloss_raw = self._style_and_glossary()
-        budgets = self._budgets()
+        budgets_default = self._budgets()
         src_lang = self.transcript.language
         translator = get_translator(self.s, style_text=style, glossary=glossary)
         weights: list[str | None] = []  # fetched once, lazily
@@ -415,6 +440,7 @@ class Job:
                         self._write_review_srt(lang, out[lang])
                         continue
                     hints, hints_raw = self._hints(lang)
+                    budgets = self._budgets_for(lang, budgets_default)
                     # Optional on the Translator interface: a backend that cannot use
                     # hints is still valid, it just does not get them.
                     set_hints = getattr(translator, "set_hints", None)
@@ -559,14 +585,15 @@ class Job:
         covered = {i for _, lines in texts for i in lines}
         if len(texts) == len(self.segments):
             merged, stuck = merge_short_fragments(segs, min_chars=self.s.min_tts_chars,
-                                                  max_gap=self.s.merge_max_gap)
+                                                  max_gap=self.s.merge_max_gap,
+                                                  stuck_gap=self.s.tts_stuck_gap)
         else:
             # Merge already done by the reviewer; doing it again would fight the file.
             merged, stuck = segs, []
         res.merged_fragments = len(covered) - len(merged)
         if stuck:
-            log.warning(f"[{lang}] {len(stuck)} short fragment(s) had no same-speaker neighbour "
-                        f"to merge into (lines {stuck}); synthesizing them alone")
+            log.warning(f"[{lang}] {len(stuck)} one-word line(s) were left unspoken "
+                        f"(lines {stuck}); see the line above for why")
 
         clips, failed = synthesize_all(
             merged, tts, refs=self.refs, ref_hashes=self.ref_hashes, language=lang,

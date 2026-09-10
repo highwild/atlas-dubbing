@@ -213,7 +213,11 @@ def settings(home, **kw) -> Settings:
     clone gets.
     """
     base = dict(home=home, languages=["de", "pl"], speakers=2, device="cpu", style="casual",
-                diarize_method="embedding", tts_backend=f"{__name__}:FakeTTS")
+                diarize_method="embedding", tts_backend=f"{__name__}:FakeTTS",
+                # The fake synthesizer never crashes on a lone word, so the fixture keeps
+                # the far-away one spoken. The real default (3s, then leave it unspoken)
+                # is pinned in test_units.py.
+                tts_stuck_gap=60.0)
     return Settings(_env_file=None, **{**base, **kw})
 
 
@@ -244,16 +248,20 @@ def test_audio_only_job(home):
         assert abs(info.frames / info.samplerate - DURATION) < 0.001
         # No content lost; short fragments merged where a same-speaker neighbour exists.
         assert r.lost_segments == []
-        assert r.merged_fragments == 2
+        # Three: "So." and "Oh" merge with their neighbours, and "Hm" — a one-word line
+        # with no same-speaker neighbour near it — is spoken with the nearest line of that
+        # speaker rather than handed to the synthesizer alone.
+        assert r.merged_fragments == 3
         # Audio in -> audio + SRT out, no mux attempted.
         assert not (out / f"{lang}.mp4").exists()
         cues = srt_cues(out / f"{lang}.srt")
-        assert len(cues) == len(SCRIPT) - 2
+        # One cue per synthesized line: 9 source lines, three fragments folded in.
+        assert len(cues) == len(SCRIPT) - 3
         for a, b in zip(cues, cues[1:]):
             assert a.end <= b.start + 0.001
         assert all(c.end <= DURATION + 0.001 for c in cues)
         assert (out / f"{lang}.review.srt").exists()
-        assert r.fit["segments"] == len(SCRIPT) - 2
+        assert r.fit["segments"] == len(SCRIPT) - 3
         assert r.fit["worst_ratio"] <= 1.2
         # Loudness matched to the source, not a fixed target.
         src_lufs = r.loudness["source"]["integrated_lufs"]
@@ -502,10 +510,12 @@ def test_srt_only_then_dub_from_edited_review(home):
 
 
 def test_one_tts_failure_is_reported_not_fatal(home):
-    FakeTTS.fail_on = {translate_text(SCRIPT[7][3], "de")}
+    # A line that survives merging as its own segment: SCRIPT[7] is now spoken together
+    # with the "Hm" fragment, so failing it would test the merger, not the failure path.
+    FakeTTS.fail_on = {translate_text(SCRIPT[6][3], "de")}
     results, _ = run(home, languages=["de"])
     r = results["de"]
-    assert r.status == "degraded" and r.lost_segments == [7]
+    assert r.status == "degraded" and r.lost_segments == [6]
     info = sf.info(home / "output" / "talk" / "de.wav")
     assert info.frames == round(DURATION * 48000)  # still exact
 
