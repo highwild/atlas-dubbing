@@ -600,6 +600,9 @@ class Job:
             clip_dir=self.job_dir / "clips" / lang, seed=self.s.tts_seed, reuse=not self.s.force,
             expand_numbers=self.s.expand_numbers,
             protected=self._protected_terms(lang),
+            expected_chars_per_second=self.s.tts_expected_chars_per_second.get(
+                lang, 12.0),
+            attempts=self.s.tts_attempts,
         )
 
         arrays, items = {}, []

@@ -504,3 +504,34 @@ def test_a_configured_rate_of_zero_leaves_the_budget_alone():
                      has_video=False)
     default = job._budgets()
     assert job._budgets_for("hi", default) == default
+
+
+def test_a_normal_hindi_clip_is_not_mistaken_for_a_loop(tmp_path):
+    """Six real Hindi lines were dropped as "runaway" because the check assumed the Latin
+    rate: 19 characters at 12 chars/s gives a 4.8s ceiling, and ordinary Hindi takes 5s."""
+    from ytdub.audio import write_wav
+    from ytdub.stages.tts.base import _looks_broken
+
+    def clip(tmp_path, seconds, name):
+        sr = 24000
+        t = np.arange(int(seconds * sr)) / sr
+        path = tmp_path / name
+        write_wav(path, (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32), sr)
+        return path
+
+    text = "नहीं, वह गैस वाला है ब्रो।"          # 19 spoken characters
+    natural = clip(tmp_path, 5.0, "natural.wav")
+    loop = clip(tmp_path, 11.0, "loop.wav")
+    assert _looks_broken(natural, text, chars_per_second=8.0) is None
+    assert _looks_broken(loop, text, chars_per_second=8.0).startswith("runaway")
+    # The same 5s clip judged by the Latin default is what went wrong before.
+    assert _looks_broken(natural, text, chars_per_second=12.0).startswith("runaway")
+
+
+def test_silence_is_still_caught_by_the_sanity_check(tmp_path):
+    from ytdub.audio import write_wav
+    from ytdub.stages.tts.base import _looks_broken
+
+    path = tmp_path / "silent.wav"
+    write_wav(path, np.zeros(24000, dtype=np.float32), 24000)
+    assert _looks_broken(path, "anything", chars_per_second=8.0) == "silent"

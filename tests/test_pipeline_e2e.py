@@ -130,6 +130,44 @@ class FakeTTS:
         pass
 
 
+class LoopingTTS(FakeTTS):
+    """Chatterbox's other failure mode: it does not crash, it loops, and hands back ten
+    seconds of repeated noise for a two-word line."""
+
+    name = "looping-tts"
+    loop_on: set[str] = set()
+
+    def synthesize(self, text, ref, language, out_path, seed):
+        if text in self.loop_on:
+            from ytdub.audio import write_wav
+
+            sr = 24000
+            t = np.arange(int(25.0 * sr)) / sr
+            write_wav(out_path, (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32), sr)
+            return out_path
+        return super().synthesize(text, ref, language, out_path, seed)
+
+
+class SlowToSettleTTS(FakeTTS):
+    """Loops for the first two seeds, like the real model on some Hindi lines (one of them
+    was clean on four of five other seeds). More attempts must rescue it, not drop it."""
+
+    name = "slow-to-settle-tts"
+    calls = 0
+
+    def synthesize(self, text, ref, language, out_path, seed):
+        SlowToSettleTTS.calls += 1
+        # Text-independent on purpose: the point is the retry, not which line it hit.
+        if SlowToSettleTTS.calls <= 2:
+            from ytdub.audio import write_wav
+
+            sr = 24000
+            t = np.arange(int(25.0 * sr)) / sr
+            write_wav(out_path, (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32), sr)
+            return out_path
+        return super().synthesize(text, ref, language, out_path, seed)
+
+
 class CudaFailTTS(FakeTTS):
     """Dies with the real CUDA fault partway through the first language.
 
@@ -725,3 +763,50 @@ def test_a_dead_cuda_context_stops_the_job_and_still_writes_the_report(home):
     # synthesizing the finished lines again.
     clips = list((home / "work").glob("talk-*/clips/de/*.wav"))
     assert len(clips) == CudaFailTTS.die_after, clips
+
+
+def test_a_looping_clip_is_dropped_not_kept(home):
+    """Measured on the Hindi track: four clips came back looping, up to 10.9s for a
+    23-character line. Keeping them cost the fit 19 late lines and a 3x compression on
+    everything around them; one reported line costs less."""
+    LoopingTTS.loop_on = {translate_text(SCRIPT[6][3], "de")}
+    results, _ = run(home, languages=["de"], tts_backend=f"{__name__}:LoopingTTS")
+    r = results["de"]
+    assert r.status == "degraded"
+    assert r.lost_segments == [6], r.lost_segments
+    log = (home / "output" / "talk" / "dub.log").read_text(encoding="utf-8")
+    assert "dropping the clip" in log
+    # Nothing 25 seconds long is left on disk to be reused as if it were speech.
+    too_long = [p for p in (home / "work").glob("talk-*/clips/de/*.wav")
+                if sf.info(p).duration > 20.0]
+    assert too_long == [], too_long
+
+
+def test_a_looping_clip_already_in_the_cache_is_resynthesized(home):
+    """The check used to run only on a fresh result, so a loop stayed cached for ever and
+    every later run reused it: the second Hindi run got the identical wrecked timeline."""
+    import soundfile as sf
+
+    results, _ = run(home, languages=["de"])
+    assert results["de"].status == "ok"
+    clips = sorted((home / "work").glob("talk-*/clips/de/*.wav"))
+    assert clips
+    # Replace one cached clip with a loop, exactly as a bad synthesis would have left it.
+    sr = 24000
+    t = np.arange(int(25.0 * sr)) / sr
+    sf.write(clips[0], (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32), sr)
+
+    results, _ = run(home, languages=["de"])
+    log = (home / "output" / "talk" / "dub.log").read_text(encoding="utf-8")
+    assert "the cached clip is runaway" in log
+    assert not [p for p in (home / "work").glob("talk-*/clips/de/*.wav")
+                if sf.info(p).duration > 20.0], "the loop must not survive the run"
+
+
+def test_a_clip_that_loops_on_the_first_seeds_is_retried_not_dropped(home):
+    SlowToSettleTTS.calls = 0
+    results, _ = run(home, languages=["de"], tts_backend=f"{__name__}:SlowToSettleTTS")
+    assert results["de"].status == "ok", results["de"].lost_segments
+    log = (home / "output" / "talk" / "dub.log").read_text(encoding="utf-8")
+    assert "retrying with another seed (3/4)" in log
+    assert "dropping the clip" not in log

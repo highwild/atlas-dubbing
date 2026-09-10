@@ -26,6 +26,10 @@ log = stage_logger("tts")
 BUILTIN = {"chatterbox": "ytdub.stages.tts.chatterbox:ChatterboxBackend"}
 
 
+# Retry seeds are spread by this much rather than incremented (see synthesize_all).
+_SEED_STRIDE = 7919
+
+
 # A CUDA context poisoned by a device-side assert (or any other sticky CUDA fault) fails
 # every subsequent CUDA call in the process. It is not a per-line problem: the model can
 # never produce audio again, so continuing turns one bad line into every remaining line of
@@ -250,13 +254,19 @@ def clip_key(text: str, language: str, ref: SpeakerRef, ref_hash: str, tts: TTSB
                      "identity": tts.cache_identity(), "seed": seed})[:24]
 
 
-def _looks_broken(path: Path, text: str) -> str | None:
-    """Cheap sanity checks for the two common TTS failures: silence and runaway output."""
+def _looks_broken(path: Path, text: str, *, chars_per_second: float = 12.0) -> str | None:
+    """Cheap sanity checks for the two common TTS failures: silence and runaway output.
+
+    ``chars_per_second`` is what this language is expected to produce, and it decides the
+    difference between slow speech and a loop. It must be the language's own rate: Hindi
+    runs at 8 characters per second, so judging it by the Latin 12 condemned six perfectly
+    ordinary lines as runaway and dropped them.
+    """
     samples, sr = read_mono(path)
     if len(samples) == 0 or float(abs(samples).max()) < 1e-3:
         return "silent"
     speech = trim_silence(samples, sr)
-    expected = spoken_chars(text) / 12.0  # generous: slow speech is ~12 chars/s
+    expected = spoken_chars(text) / max(chars_per_second, 1.0)
     if len(speech) / sr > max(4.0, expected * 3.0):
         return f"runaway ({len(speech) / sr:.1f}s for {spoken_chars(text)} chars)"
     return None
@@ -274,6 +284,8 @@ def synthesize_all(
     reuse: bool = True,
     expand_numbers: bool = True,
     protected: list[str] | None = None,
+    expected_chars_per_second: float = 12.0,
+    attempts: int = 4,
 ) -> tuple[dict[int, Path], list[int]]:
     """Synthesize (or reuse) a clip per segment. Returns ``(index -> clip, failed)``.
 
@@ -300,9 +312,18 @@ def synthesize_all(
         key = clip_key(to_speak, language, refs[spk], ref_hashes[spk], tts, seed)
         path = clip_dir / f"{key}.wav"
         if reuse and path.exists():
-            clips[seg.index] = path
-        else:
-            todo.append((seg, spk, path))
+            # A cached clip is checked too. The check used to run only on a fresh result,
+            # which meant a loop stayed in the cache for ever: the second Hindi run reused
+            # four of them and got the identical wrecked timeline. Half a second of reading
+            # a WAV is worth catching that.
+            problem = _looks_broken(path, to_speak,
+                                      chars_per_second=expected_chars_per_second)
+            if problem is None:
+                clips[seg.index] = path
+                continue
+            log.warning(f"[{language}] line {seg.index}: the cached clip is {problem}; "
+                        "synthesizing it again")
+        todo.append((seg, spk, path))
     if clips:
         log.info(f"[{language}] {len(clips)}/{len(segments)} clips reused from cache")
     # Logged for every affected line, reused or not: on a resumed run the interesting
@@ -322,14 +343,32 @@ def synthesize_all(
         try:
             tmp = path.with_name(path.stem + ".tmp.wav")
             problem = None
-            for attempt in range(2):
-                tts.synthesize(text, refs[spk].path, language, tmp, seed + attempt)
-                problem = _looks_broken(tmp, text)
+            for attempt in range(max(1, attempts)):
+                # Seed stride, not +1: consecutive seeds landed on the same loop four
+                # times in a row for one Hindi line, while seeds thousands apart came back
+                # clean. Whatever the correlation is, spreading the seeds escapes it.
+                tts.synthesize(text, refs[spk].path, language, tmp,
+                               seed + attempt * _SEED_STRIDE)
+                problem = _looks_broken(
+                    tmp, text, chars_per_second=expected_chars_per_second)
                 if not problem:
                     break
-                log.warning(f"[{language}] line {seg.index}: {problem}, retrying with new seed")
+                log.warning(f"[{language}] line {seg.index}: {problem}, retrying with "
+                            f"another seed ({attempt + 2}/{max(1, attempts)})")
             if problem:
-                log.warning(f"[{language}] line {seg.index}: still {problem}; keeping it")
+                # Keeping it is the worse option. A clip that is still silent or still
+                # looping after a fresh seed is not speech: a ten-second loop for a
+                # twenty-character line goes into the timeline three times its own length,
+                # the fitter compresses it to the hard cap, and every line around it is
+                # pushed late (measured: 19 lines, worst 7.8s). One line with no audio is
+                # reported; a wrecked timeline is not.
+                log.error(f"[{language}] line {seg.index}: still {problem} after "
+                          f"{max(1, attempts)} seeds; dropping the clip and reporting the "
+                          "line (a loop is not speech, and it costs the lines around it "
+                          "their timing)")
+                failed.append(seg.index)
+                tmp.unlink(missing_ok=True)  # not left behind to be mistaken for a clip
+                continue
             tmp.replace(path)
             clips[seg.index] = path
         except Exception as exc:

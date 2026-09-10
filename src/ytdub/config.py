@@ -180,6 +180,18 @@ class Settings(BaseSettings):
     # synthesizer crash (host-side IndexError, or a device-side assert that poisons the
     # CUDA context) or loop into a multi-second clip for a two-letter line.
     tts_stuck_gap: float = 3.0
+    # Seeds to try before giving up on a clip. Chatterbox's loop is seed-dependent, not
+    # text-dependent: of the Hindi lines that looped twice in a row, one was clean on four
+    # of five other seeds and two were clean on all five. Retrying costs a few seconds;
+    # dropping the line costs the line.
+    tts_attempts: int = 4
+    # Characters per second this language is *expected* to produce, used only to tell a
+    # normal clip from a looping one. Too high a rate and ordinary clips are thrown away as
+    # "runaway": at the Latin default of 12, six natural Hindi lines (19-53 characters,
+    # 5-10 seconds) were dropped in one run. Measured with the real synthesizer, Hindi runs
+    # at 7.5-10.7 characters per second, so 8 is the honest expectation for it.
+    tts_expected_chars_per_second: dict[str, float] = Field(
+        default_factory=lambda: {"hi": 8.0})
     merge_max_gap: float = 1.5  # only merge into a neighbour this close in time
     # Write digits out as words for the synthesizer only ("7,8" -> "siedem przecinek
     # osiem"). The SRT keeps the digits; see stages/numbers.py for what is left alone.
