@@ -9,6 +9,7 @@ import socket
 import numpy as np
 import pytest
 
+from ytdub.config import DEFAULT_LANGUAGES
 from ytdub.models import Segment
 
 
@@ -252,6 +253,57 @@ def test_cli_without_args_prints_usage_and_styles(tmp_path, monkeypatch, capsys)
     assert cli.main([]) == 1
     out = capsys.readouterr().out
     assert "casual" in out and "duo" in out
+
+
+def test_bare_cli_dubs_the_newest_file_in_input(tmp_path, monkeypatch, capsys):
+    """`dub2` with nothing after it means "the file I just dropped in" — the newest one,
+    announced before anything expensive starts."""
+    import os
+    import time
+
+    from ytdub import cli, pipeline
+
+    home = _home(tmp_path)
+    monkeypatch.setenv("YTDUB_HOME", str(home))
+    for name, age in (("old.wav", 3600), ("new.wav", 60)):
+        (home / "input" / name).write_bytes(b"x")
+        os.utime(home / "input" / name, (time.time() - age, time.time() - age))
+    captured = {}
+
+    def fake_run(settings, input_arg, **kw):
+        captured["input"] = input_arg
+        captured["languages"] = settings.languages
+        return []
+
+    monkeypatch.setattr(pipeline, "run_job", fake_run)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    assert cli.main([]) == 0
+    assert captured["input"] == "new.wav"
+    assert captured["languages"] == DEFAULT_LANGUAGES, "no languages named means all of them"
+    assert "new.wav" in capsys.readouterr().out
+
+
+def test_bare_cli_says_nothing_to_do_when_input_is_empty(tmp_path, monkeypatch, capsys):
+    from ytdub import cli
+
+    monkeypatch.setenv("YTDUB_HOME", str(_home(tmp_path)))
+    assert cli.main([]) == 1
+    assert "Nothing to dub" in capsys.readouterr().out
+
+
+def test_bare_cli_asks_before_picking_when_several_files_are_there(tmp_path, monkeypatch, capsys):
+    from ytdub import cli, pipeline
+
+    home = _home(tmp_path)
+    monkeypatch.setenv("YTDUB_HOME", str(home))
+    for name in ("a.wav", "b.wav"):
+        (home / "input" / name).write_bytes(b"x")
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    monkeypatch.setattr(pipeline, "run_job",
+                        lambda *a, **k: pytest.fail("declining the pick must not run a job"))
+    assert cli.main([]) == 1
+    assert "Name the file" in capsys.readouterr().out
 
 
 def test_cli_flags_in_any_order(tmp_path, monkeypatch):

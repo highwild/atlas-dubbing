@@ -1,9 +1,10 @@
 """``dub``: one command per job.
 
-    dub myfile.wav                              # all default languages
-    dub myfile.wav --style duo --speakers 2     # conversation, two voices
-    dub myfile.wav --style professional de fr   # subset of languages
-    dub                                         # usage + available styles
+    dub2                                        # newest file in input/, all languages
+    dub2 myfile.wav                             # all default languages
+    dub2 myfile.wav --style duo --speakers 2    # conversation, two voices
+    dub2 myfile.wav --style professional de fr  # subset of languages
+    dub2 --help                                 # usage + available styles
 
 Flags and languages may come in any order.
 """
@@ -91,6 +92,43 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _input_candidates(settings: Settings) -> list[Path]:
+    """Files in ``input/``, newest first. Empty when the directory is missing or empty."""
+    if not settings.input_dir.is_dir():
+        return []
+    files = [f for f in settings.input_dir.iterdir()
+             if f.is_file() and not f.name.startswith(".")]
+    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def _pick_input(settings: Settings) -> str | None:
+    """What ``dub2`` with no file should dub: the newest file in ``input/``.
+
+    "The file I just dropped in" is the only reading of a bare command that is never a
+    guess in practice, so newest wins over alphabetical order. With more than one
+    candidate at a terminal it asks first — a wrong pick is not a wrong answer, it is an
+    hour of GPU on the wrong video — and it announces the choice either way, so the file
+    being dubbed is the first thing in the log rather than something noticed later.
+    """
+    candidates = _input_candidates(settings)
+    if not candidates:
+        return None
+    picked = candidates[0]
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(picked.stat().st_mtime))
+    if len(candidates) > 1 and sys.stdin.isatty():
+        others = ", ".join(f.name for f in candidates[1:4])
+        more = f" (+{len(candidates) - 4} more)" if len(candidates) > 4 else ""
+        answer = input(f"{len(candidates)} files in {settings.input_dir}; newest is "
+                       f"{picked.name}. Others: {others}{more}.\n"
+                       f"Dub {picked.name}? [Y/n] ").strip().lower()
+        if answer not in ("", "y", "yes"):
+            print("Nothing run. Name the file: dub2 <file> [langs]")
+            return ""
+    print(f"No file named; dubbing the newest in {settings.input_dir}: "
+          f"{picked.name} ({when})", flush=True)
+    return picked.name
+
+
 def _usage(p: argparse.ArgumentParser, settings: Settings) -> None:
     p.print_help()
     styles = available_styles(settings.styles_dir)
@@ -99,10 +137,10 @@ def _usage(p: argparse.ArgumentParser, settings: Settings) -> None:
     if settings.input_dir.is_dir():
         files = sorted(f.name for f in settings.input_dir.iterdir() if f.is_file())
         print(f"\nFiles in {settings.input_dir}:" + ("".join(f"\n  {f}" for f in files) or "\n  (empty)"))
-    print("\nExamples:\n  dub solo.wav\n  dub chat.wav --style duo --speakers 2\n"
-          "  dub doc.wav --style professional de fr\n  dub talk.wav --srt-only de pl   "
-          "# then edit output/talk/de.review.srt\n  dub talk.wav --from-review de pl\n"
-          "  dub solo.wav --srt-only pl --verify   # back-translation check + "
+    print("\nExamples:\n  dub2                       # newest file in input/, all languages\n"
+          "  dub2 doc.wav --style professional de fr\n  dub2 talk.wav --srt-only de pl   "
+          "# then edit output/talk/de.review.srt\n  dub2 talk.wav --from-review de pl\n"
+          "  dub2 solo.wav --srt-only pl --verify   # back-translation check + "
           "output/solo/pl.verify.txt")
 
 
@@ -159,8 +197,14 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings(**overrides)
 
     if not args.input:
-        _usage(parser, settings)
-        return 1
+        picked = _pick_input(settings)
+        if not picked:
+            _usage(parser, settings)
+            if picked is None:
+                print(f"\nNothing to dub: {settings.input_dir} is empty. Drop a file in "
+                      "there and run dub2 again, or name one.")
+            return 1
+        args.input = picked
     styles = available_styles(settings.styles_dir)
     if settings.style not in styles:
         print(f"No style called {settings.style!r}. Available: {', '.join(styles) or 'none'}")

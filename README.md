@@ -11,6 +11,7 @@ and has been rebuilt per [`DUBBING_PIPELINE_SPEC.md`](DUBBING_PIPELINE_SPEC.md).
 Install and usage are in [`SETUP.md`](SETUP.md).
 
 ```bash
+dub2                                        # newest file in input/, every language
 dub2 myfile.wav pl fr                       # the whole job: voices counted, references cut,
                                             #   translated, synthesized, fitted, assembled
 dub2 myfile.wav                             # all default languages (de fr pl es nl hi)

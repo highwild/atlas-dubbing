@@ -51,11 +51,23 @@ dub2 cheese.wav pl                              # if ~/.local/bin is on PATH
 .venv/bin/python -m ytdub.cli cheese.wav pl     # bypasses the entry point entirely
 ```
 
-`dub` with no arguments prints usage, the available styles and the files in `input/`:
+`dub2` with no arguments runs the newest file in `input/`, in every language:
 
 ```bash
-dub2
+dub2                    # == dub2 <newest file in input/> de fr pl es nl hi
+dub2 --help             # usage, available styles, what is in input/
 ```
+
+That is the whole flow: copy a file into `input/`, type `dub2`, walk away. Nothing else is
+needed — voices are counted, references are cut, your clip in `.env` is matched by voice,
+every language is translated and dubbed.
+
+With more than one file in `input/` it says which one it is about to use and asks first
+(only at a terminal). Declining, or an empty `input/`, prints usage and runs nothing. To
+skip the question, name the file: `dub2 hydro.wav`.
+
+Which file counts as newest is by modification time, so a file you just copied over is the
+one it picks. The choice is the first line of the log.
 
 ---
 
@@ -66,6 +78,10 @@ Positional, and they may be in any order with the flags:
 ```bash
 dub2 <input> <lang...>
 ```
+
+Both are optional: no `input` means the newest file in `input/`, no languages means all of
+`de fr pl es nl hi`.
+
 
 | Positional | Meaning |
 |---|---|
@@ -331,6 +347,12 @@ Ollama before synthesis starts.
 
 ```bash
 dub2 hydro.wav pl fr
+```
+
+or, for the file you just dropped in, every language:
+
+```bash
+dub2
 ```
 
 That is the whole command. Transcription, diarization, one reference clip per detected
