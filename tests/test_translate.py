@@ -253,6 +253,7 @@ def test_a_cut_off_answer_is_given_more_room_before_the_batch_is_split():
 
 
 FRAG_N = re.compile(r"line (\d+) to translate now")
+REPEAT_N = re.compile(r"Line (\d+) was answered")
 
 
 def test_a_fragment_that_came_back_untranslated_is_asked_again():
@@ -310,6 +311,52 @@ def test_a_retry_that_returns_the_whole_sentence_is_rejected():
     t = translator(FakeClient(responder), batch_lines=3)
     assert t.translate(lines) == ["T1", "would", "T3"]
     assert t.stats.echoes_fixed == 0
+
+
+def test_a_line_that_came_back_as_the_line_above_it_is_translated_again():
+    """hydro.wav, in German, Hindi, Polish and Spanish: one line was answered with the
+    next line's text and then repeated, so the line it skipped was spoken nowhere."""
+    def responder(user):
+        if "was answered with the same text" in user:
+            n = int(REPEAT_N.search(user)[1])
+            return answer({n: "naprawdę przynosi korzyści w kwestii kosztów"})
+        # The batch repeats line 1's text for line 2.
+        return answer({n: ("idzie do przodu" if n == 1 else
+                           ("idzie do przodu" if n == 2 else f"T{n}"))
+                       for n in asked(user)})
+
+    lines = [Line(1, "it moves forward", 40), Line(2, "and it does so quickly", 40),
+             Line(3, "another sentence entirely", 40)]
+    t = translator(FakeClient(responder), batch_lines=3)
+    assert t.translate(lines) == ["idzie do przodu",
+                                 "naprawdę przynosi korzyści w kwestii kosztów", "T3"]
+    assert t.stats.repeated_lines == 1 and t.stats.repeats_fixed == 1
+
+
+def test_two_lines_that_really_do_say_the_same_thing_are_left_alone():
+    """Whisper repeats itself. When both sources match, the matching translations are
+    correct and re-asking would only make them different for no reason."""
+    def responder(user):
+        assert "was answered with the same text" not in user
+        return answer({n: "to samo zdanie" for n in asked(user)})
+
+    lines = [Line(1, "the same sentence here", 40), Line(2, "the same sentence here", 40)]
+    t = translator(FakeClient(responder), batch_lines=2)
+    assert t.translate(lines) == ["to samo zdanie", "to samo zdanie"]
+    assert t.stats.repeated_lines == 0
+
+
+def test_a_retry_that_repeats_the_line_above_again_is_refused():
+    def responder(user):
+        if "was answered with the same text" in user:
+            return answer({int(REPEAT_N.search(user)[1]): "idzie do przodu"})
+        return answer({n: "idzie do przodu" for n in asked(user)})
+
+    lines = [Line(1, "it moves forward", 40), Line(2, "and it does so quickly", 40)]
+    t = translator(FakeClient(responder), batch_lines=2)
+    out = t.translate(lines)
+    assert out == ["idzie do przodu", "idzie do przodu"]
+    assert t.stats.repeats_fixed == 0
 
 
 def test_the_answer_budget_always_covers_the_estimate_and_stays_in_the_window():

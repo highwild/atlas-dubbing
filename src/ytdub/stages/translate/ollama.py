@@ -62,6 +62,7 @@ from ytdub.stages.translate.prompt import (
     parse_lines,
     repair_groups,
     repair_prompt,
+    repeat_retry_prompt,
     single_line_prompt,
     strip_thinking,
     system_prompt,
@@ -259,6 +260,10 @@ class TranslationStats:
     echo_lines: int = 0
     echo_retries: int = 0
     echoes_fixed: int = 0
+    # Lines that came back with the line above them: one line spoken twice, another lost.
+    repeated_lines: int = 0
+    repeat_retries: int = 0
+    repeats_fixed: int = 0
     over_budget_initial: int = 0
     over_budget_final: int = 0
     repair_requests: int = 0
@@ -367,6 +372,7 @@ class BatchTranslator:
             log.info(f"[{self.tgt}] translated {min(pos + size, len(lines))}/{len(lines)} lines")
             pos += size
         self._retry_source_echoes(lines, done)
+        self._repair_repeated_lines(lines, done)
         if self.verify:
             self._verify_translations(lines, done)
         self._repair_budgets(lines, done)
@@ -487,6 +493,79 @@ class BatchTranslator:
             self.stats.echoes_fixed += 1
             log.success(f"[{self.tgt}] line {line.n} was untranslated ({line.text.strip()!r}) "
                         f"-> {got!r}")
+
+    @staticmethod
+    def _content_words(text: str) -> set[str]:
+        import re
+
+        return {w for w in re.findall(r"[\w\u0900-\u097F]+", text.casefold())
+                if len(w) > 3}
+
+    def _repair_repeated_lines(self, lines: list[Line], done: dict[int, str]) -> None:
+        """Re-ask for a line that came back with the line above it's text.
+
+        Measured on hydro.wav: in German, Hindi, Polish and Spanish a line was answered
+        with the *next* line's text and then that text was repeated, so one source line's
+        content appeared nowhere in the track — German lost "completely out of action, a
+        fantastic depot", Polish lost a carriage-shunting line, Spanish lost the closing
+        sentence. The wording was fine everywhere; the mapping from line to line was not.
+
+        Both lines of the pair are re-asked, because which of the two is the duplicate
+        cannot be told from the text alone. A retry is accepted only if it no longer
+        repeats its neighbour, so this can turn a repeated line into a distinct one and
+        never the other way round.
+        """
+        if self.echo_retries < 1:
+            return
+        words = self._content_words
+        pairs = []
+        for i in range(1, len(lines)):
+            mine, above = done.get(lines[i].n, ""), done.get(lines[i - 1].n, "")
+            if not mine or not above:
+                continue
+            same = words(mine) & words(above)
+            if not same or len(same) / max(1, len(words(mine) | words(above))) < 0.6:
+                continue
+            # Identical sources mean the duplicate is correct (Whisper repeats itself).
+            src_same = words(lines[i].text) & words(lines[i - 1].text)
+            if src_same and len(src_same) / max(1, len(words(lines[i].text)
+                                                      | words(lines[i - 1].text))) >= 0.6:
+                continue
+            pairs.append((i - 1, i))
+        if not pairs:
+            return
+        log.warning(f"[{self.tgt}] {len(pairs)} line(s) came back with the line above them "
+                    f"({[lines[i].n for _, i in pairs]}); translating them again so no line "
+                    "is spoken twice and none is skipped")
+        self.stats.repeated_lines += len(pairs)
+        for above_i, i in pairs:
+            line = lines[i]
+            user = repeat_retry_prompt(
+                line,
+                lines[above_i].text,
+                lines[i + 1].text if i + 1 < len(lines) else None,
+                done.get(line.n, ""), self.src, self.tgt)
+            self.stats.repeat_retries += 1
+            try:
+                result = self.client.chat(
+                    self.system, user,
+                    num_predict=self._answer_budget(user, [line], factor=2.0),
+                    schema=RESPONSE_SCHEMA, label=f"[{self.tgt} repeat {line.n}]")
+                answer = parse_lines(result.content, [line.n])
+            except ParseError as exc:
+                log.debug(f"[{self.tgt}] line {line.n} repeat retry unusable ({exc})")
+                continue
+            got = answer.get(line.n, "").strip()
+            if not got or verify_mod.translation_passed_through(line.text, got):
+                continue
+            still = words(got) & words(done.get(lines[above_i].n, ""))
+            if still and len(still) / max(1, len(words(got) | words(done[lines[above_i].n]))) >= 0.6:
+                log.debug(f"[{self.tgt}] line {line.n} repeated the line above again")
+                continue
+            done[line.n] = got
+            self.stats.repeats_fixed += 1
+            log.success(f"[{self.tgt}] line {line.n} was a copy of line {lines[above_i].n}; "
+                        f"now {got!r}")
 
     @staticmethod
     def _is_continuation(lines: list[Line], i: int) -> bool:

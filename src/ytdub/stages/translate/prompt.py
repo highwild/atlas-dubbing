@@ -182,6 +182,42 @@ def single_line_prompt(line: Line, context: list[tuple[Line, str]], target_lang:
     return batch_prompt([line], context, [], target_lang)
 
 
+def repeat_retry_prompt(line: Line, prev_text: str | None, next_text: str | None,
+                        previous_reply: str, source_lang: str, target_lang: str) -> str:
+    """Ask again for a line that came back the same as the line before it.
+
+    Seen on hydro.wav in four languages: line 44 was given line 45's text ("test track")
+    and line 45 was given it again, so line 44's own source — "completely out of action, a
+    fantastic depot" — was never spoken in any of those tracks. The model tracks the
+    numbered lines loosely when they are sentence fragments and catches up by repeating
+    one, which loses the line it skipped. Naming both lines is the whole fix: this line,
+    this source, not the one above it.
+    """
+    tgt, src = lang_name(target_lang), lang_name(source_lang)
+    parts = [
+        (f"Line {line.n} was answered with the same text as the line before it, but the two "
+         f"lines are different {src} sentences."),
+        "",
+        f"the reply for line {line.n} was: {previous_reply.strip()}",
+        "",
+        (f"That belongs to the line before. Line {line.n} is this, and it needs its own "
+         f"{tgt} translation:"),
+        f"  {line.text.strip()}",
+        "",
+    ]
+    if prev_text:
+        parts.append(f"For reference, the line before ({src}): {prev_text.strip()}")
+    if next_text:
+        parts.append(f"And the line after ({src}): {next_text.strip()}")
+    parts += ["",
+              (f"Translate line {line.n} only. Do not repeat the line before it. Budget: at "
+               f"most {line.budget} characters."),
+              "",
+              'Reply with JSON only: {"lines":[{"n":' + str(line.n)
+              + ',"text":"..."}]}']
+    return "\n".join(parts)
+
+
 def fragment_retry_prompt(line: Line, prev_text: str | None, next_text: str | None,
                           source_lang: str, target_lang: str) -> str:
     """Ask again for a line that came back as the source written out.
