@@ -49,6 +49,7 @@ from ytdub.stages.translate.prompt import (
     Hint,
     Line,
     ParseError,
+    TruncatedAnswer,
     batch_prompt,
     estimate_tokens,
     glossary_misses,
@@ -68,6 +69,16 @@ log = stage_logger("translate")
 
 # Chat-template tokens Ollama wraps around the messages.
 _TEMPLATE_OVERHEAD = 32
+
+# How much room to give the answer on top of the estimator's number. Measured, not
+# guessed: for a 30-line Polish batch of tangi.wav the estimator said 923 tokens and the
+# model used 955 — a 3% margin, so a batch that ran slightly long was cut off mid-JSON,
+# thrown away, and redone in halves. The cost of headroom is nothing (the window is far
+# from full at these batch sizes); the cost of being wrong is a wasted generation plus the
+# context that the smaller batch loses.
+ANSWER_HEADROOM = 1.6
+# And if it is cut off anyway, this much more before giving up on the batch.
+ANSWER_ESCALATION = 3.0
 
 
 class OllamaError(RuntimeError):
@@ -238,6 +249,7 @@ class TranslationStats:
     batch_splits: int = 0
     single_line_fallbacks: int = 0
     untranslated: list[int] = field(default_factory=list)
+    answer_escalations: int = 0  # batches cut off at num_predict and retried with more room
     over_budget_initial: int = 0
     over_budget_final: int = 0
     repair_requests: int = 0
@@ -291,11 +303,26 @@ class BatchTranslator:
         self.stats = TranslationStats(verified=verify)
 
     # -- sizing ----------------------------------------------------------------
-    def _fits(self, user: str, lines: list[Line]) -> tuple[bool, int]:
-        num_predict = output_token_estimate(lines, self.tgt)
-        need = (estimate_tokens(self.system) + estimate_tokens(user) + num_predict
+    def _prompt_tokens(self, user: str) -> int:
+        return (estimate_tokens(self.system) + estimate_tokens(user)
                 + _TEMPLATE_OVERHEAD + 16)
-        return need <= self.client.num_ctx, num_predict
+
+    def _answer_budget(self, user: str, lines: list[Line], *,
+                       factor: float = ANSWER_HEADROOM) -> int:
+        """Tokens to allow the answer: the estimator times ``factor``, inside the window.
+
+        Never below the estimator: ``_fits`` has already established that the prompt plus
+        the estimator fits, so the room left is at least the estimator. The cap only ever
+        trims the headroom, never the minimum the answer needs.
+        """
+        need = output_token_estimate(lines, self.tgt)
+        room = self.client.num_ctx - self._prompt_tokens(user)
+        return max(min(int(need * factor), room), need)
+
+    def _fits(self, user: str, lines: list[Line]) -> tuple[bool, int]:
+        need = output_token_estimate(lines, self.tgt)
+        return (self._prompt_tokens(user) + need <= self.client.num_ctx,
+                self._answer_budget(user, lines))
 
     def _context(self, lines: list[Line], start: int, done: dict[int, str]):
         ctx = [(ln, done[ln.n]) for ln in lines[max(0, start - self.context_lines):start]
@@ -339,18 +366,35 @@ class BatchTranslator:
         batch = lines[pos:pos + size]
         look = lines[pos + size:pos + size + self.lookahead_lines]
         user = batch_prompt(batch, self._context(lines, pos, done), look, self.tgt)
-        _, num_predict = self._fits(user, batch)
-        self.stats.batches += 1
-        try:
-            result = self.client.chat(self.system, user, num_predict=num_predict,
-                                      schema=RESPONSE_SCHEMA,
-                                      label=f"[{self.tgt} lines {batch[0].n}-{batch[-1].n}]")
-            if result.done_reason == "length":
-                raise ParseError("answer hit num_predict and was cut off")
-            done.update(parse_lines(result.content, [ln.n for ln in batch]))
-            return
-        except ParseError as exc:
-            log.warning(f"[{self.tgt}] batch {batch[0].n}-{batch[-1].n} unusable ({exc})")
+        label = f"[{self.tgt} lines {batch[0].n}-{batch[-1].n}]"
+        # A cut-off answer gets more room before the batch is given up on: the answer was
+        # unfinished, not wrong, and halving the batch loses the context that makes the
+        # translation consistent with its neighbours.
+        budgets = [self._answer_budget(user, batch),
+                   self._answer_budget(user, batch, factor=ANSWER_ESCALATION)]
+        for attempt, num_predict in enumerate(budgets):
+            self.stats.batches += 1
+            try:
+                result = self.client.chat(self.system, user, num_predict=num_predict,
+                                          schema=RESPONSE_SCHEMA, label=label)
+                if result.done_reason == "length":
+                    raise TruncatedAnswer("answer hit num_predict and was cut off",
+                                          budget=num_predict)
+                done.update(parse_lines(result.content, [ln.n for ln in batch]))
+                return
+            except TruncatedAnswer as exc:
+                if attempt + 1 < len(budgets) and budgets[attempt + 1] > num_predict:
+                    self.stats.answer_escalations += 1
+                    log.warning(f"[{self.tgt}] batch {batch[0].n}-{batch[-1].n} {exc} at "
+                                f"{num_predict} tokens; retrying with "
+                                f"{budgets[attempt + 1]}")
+                    continue
+                log.warning(f"[{self.tgt}] batch {batch[0].n}-{batch[-1].n} unusable ({exc})")
+            except ParseError as exc:
+                # A malformed or echoing answer is not a sizing problem; more room would
+                # only produce a longer wrong answer.
+                log.warning(f"[{self.tgt}] batch {batch[0].n}-{batch[-1].n} unusable ({exc})")
+                break
         if size > 1:
             self.stats.batch_splits += 1
             half = size // 2
@@ -366,7 +410,7 @@ class BatchTranslator:
         for attempt in range(2):
             try:
                 result = self.client.chat(self.system, user,
-                                          num_predict=output_token_estimate([line], self.tgt) * 2,
+                                          num_predict=self._answer_budget(user, [line], factor=2.0),
                                           schema=RESPONSE_SCHEMA,
                                           label=f"[{self.tgt} line {line.n}, retry {attempt}]")
                 done.update(parse_lines(result.content, [line.n]))
@@ -397,7 +441,7 @@ class BatchTranslator:
                 try:
                     result = self.client.chat(
                         self.system, user, schema=RESPONSE_SCHEMA,
-                        num_predict=output_token_estimate([by_n[n] for n in group], self.tgt),
+                        num_predict=self._answer_budget(user, [by_n[n] for n in group]),
                         label=f"[{self.tgt} shorten {group[0]}-{group[-1]}]",
                     )
                     revised = parse_lines(result.content, group)

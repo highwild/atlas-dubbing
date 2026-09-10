@@ -205,6 +205,19 @@ class ParseError(ValueError):
     pass
 
 
+class TruncatedAnswer(ParseError):
+    """The answer ran into ``num_predict`` and was cut off mid-JSON.
+
+    Separate from a plain :class:`ParseError` because it is the one failure that more room
+    fixes: the answer was not wrong, it was unfinished. A malformed object, a missing line
+    or an echo is a bad answer at any size.
+    """
+
+    def __init__(self, message: str, budget: int | None = None) -> None:
+        super().__init__(message)
+        self.budget = budget
+
+
 _THINK = re.compile(r"<think>.*?(</think>|$)", re.S)
 _FENCE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 _TAG = re.compile(r"^\s*\[(?:SPK\d+|≤\s*\d+)\]\s*")

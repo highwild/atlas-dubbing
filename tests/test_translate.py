@@ -26,6 +26,7 @@ from ytdub.stages.translate.prompt import (
     lower_bound_tokens,
     merge_hints,
     needs_repair,
+    output_token_estimate,
     parse_lines,
     repair_groups,
     system_prompt,
@@ -226,6 +227,42 @@ def test_truncated_answer_counts_as_failure():
     t = translator(Cut(None), batch_lines=4)
     assert t.translate(make_lines(4)) == ["T1", "T2", "T3", "T4"]
     assert t.stats.batch_splits >= 1
+
+
+def test_a_cut_off_answer_is_given_more_room_before_the_batch_is_split():
+    """More tokens fixes a truncated answer without losing the batch's context. Splitting
+    is the fallback, not the first response — measured on tangi.wav, where a 30-line
+    Polish batch that needed 955 tokens was allowed 923."""
+    budgets: list[int] = []
+
+    class CutOnce(FakeClient):
+        def chat(self, system, user, *, num_predict, schema=None, label=""):
+            self.calls.append(user)
+            budgets.append(num_predict)
+            # Cut off at every budget up to the escalation, then answer properly.
+            if num_predict < 300:
+                return ChatResult("", 100, num_predict, "length")
+            return ChatResult(echo(user), 100, 20, "stop")
+
+    t = translator(CutOnce(None), batch_lines=4)
+    assert t.translate(make_lines(4)) == ["T1", "T2", "T3", "T4"]
+    assert len(budgets) == 2 and budgets[1] > budgets[0], budgets
+    assert t.stats.batch_splits == 0, "the batch was recoverable without splitting it"
+    assert t.stats.answer_escalations == 1
+    assert t.stats.untranslated == []
+
+
+def test_the_answer_budget_always_covers_the_estimate_and_stays_in_the_window():
+    client = FakeClient(echo, num_ctx=4096)
+    t = translator(client, batch_lines=4)
+    lines = make_lines(4, budget=300)
+    user = "x" * 3000
+    est = output_token_estimate(lines, "pl")
+    budget = t._answer_budget(user, lines)
+    assert budget >= est
+    assert t._prompt_tokens(user) + budget <= client.num_ctx
+    # A prompt that leaves almost nothing still gets the estimator's number, never less.
+    assert t._answer_budget("y" * 100_000, lines) >= est
 
 
 def test_batches_shrink_to_fit_a_small_window():
