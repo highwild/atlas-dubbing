@@ -10,3 +10,13 @@ seriously rather than for laughs.
 Translate into clear, well-formed speech that stays approachable. Avoid stiff or
 bureaucratic phrasing - it should sound like a knowledgeable person explaining
 something well, not a press release.
+
+Locale rules:
+- Numbers: spell numbers out as words so they are read correctly aloud. Years are
+  written the way a native speaker says them.
+- Currency: keep the original currency and amount (spelled out). Do not convert:
+  the figures are facts about the UK.
+- Dates: use the target language's normal spoken order ("the fifth of June" becomes
+  the local equivalent).
+- Units: keep miles and mph (UK railway figures are quoted that way and match the
+  screen); if a distance is given purely for scale, the local unit may be added.

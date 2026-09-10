@@ -1,6 +1,3 @@
-"""Pipeline stages: download -> transcribe -> translate -> synthesize -> synchronize -> assemble.
-
-Each stage is a small module with a single entry function and *lazy* heavy imports,
-so importing the package (and running ``ytdub --help``) never requires torch, whisper
-or a TTS engine to be installed.
-"""
+"""Pipeline stages. Heavy dependencies (torch, faster-whisper, Chatterbox, yt-dlp) are
+imported lazily inside the functions that need them, so importing a stage module, and
+running the unit tests, never requires a GPU or model weights."""

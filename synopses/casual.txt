@@ -7,3 +7,12 @@ and tangents. He speaks to viewers like mates rather than an audience.
 The subject is video games, train simulators and the communities around them.
 Translate so it sounds like a native speaker being equally relaxed and funny -
 never stiff or formal.
+
+Locale rules:
+- Numbers: spell every number out as words, the way it would be said aloud. No digits.
+- Currency: keep pounds as pounds (spelled out, e.g. "five pounds"); do not convert.
+  In-game currencies are names and stay untranslated.
+- Dates: use the target language's normal spoken order.
+- Units: keep miles and mph as they are - they match what is shown on screen in
+  the games. Other imperial units may be given in the natural local unit if the
+  exact figure does not matter to the joke or point.

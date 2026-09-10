@@ -1,109 +1,190 @@
-"""Text-to-speech / voice-cloning interface + factory.
+"""Synthesize stage: fragment merging, per-clip cached synthesis, progress reporting.
 
-The backend's job: synthesize *target-language* text in the *original speaker's* voice,
-given a short reference clip of that speaker. Backends are swappable:
-
-  * ``xtts``      — Coqui XTTS-v2. One pip install, multilingual, CPU-capable. Default.
-  * ``openvoice`` — OpenVoice v2 (MeloTTS + tone-color converter). Fully MIT-licensed.
-
-Keeping this behind a Protocol means the rest of the pipeline never cares which model
-is producing the audio — you can A/B them with a single ``--tts`` flag.
+Clips are cached by a hash of everything that determines them (text, language,
+reference clip content, TTS model and parameters), so a crash mid-language resumes
+where it stopped and editing one line of a review SRT only resynthesizes that line.
 """
 
 from __future__ import annotations
 
+import time
+import unicodedata
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
+from ytdub.audio import read_mono, trim_silence
+from ytdub.cache import hash_obj
 from ytdub.logging import stage_logger
-from ytdub.models import Segment
+from ytdub.models import Segment, SpeakerRef
+from ytdub.plugins import load_class
 
 log = stage_logger("tts")
 
 
+BUILTIN = {"chatterbox": "ytdub.stages.tts.chatterbox:ChatterboxBackend"}
+
+
 class TTSBackend(Protocol):
-    def synthesize(
-        self, text: str, speaker_wav: Path, language: str, out_path: Path
-    ) -> Path: ...
+    """Voice-cloning TTS interface.
+
+    Only Chatterbox ships, but any class with this shape can be dropped in with
+    ``YTDUB_TTS_BACKEND=module.path:ClassName`` (or ``--tts``). It is constructed as
+    ``cls(settings)``; its module must import cheaply (load the model lazily), because
+    the CLI reads ``supported_languages`` from the class before a job starts.
+    """
+
+    name: str
+    supported_languages: set[str]  # class attribute, ISO-639-1 codes
+
+    def cache_identity(self) -> dict:
+        """Model, version and parameters: anything that changes the audio. Part of every
+        clip's cache key, so switching backend or upgrading one never reuses old clips."""
+
+    def synthesize(self, text: str, ref: Path, language: str, out_path: Path, seed: int) -> Path:
+        """Write a mono WAV of ``text`` in the voice of reference clip ``ref``."""
+
+    def unload(self) -> None:
+        """Free VRAM. Called once, after all languages."""
 
 
-def get_tts(name: str, device: str) -> TTSBackend:
-    name = name.lower()
-    if name == "xtts":
-        from ytdub.stages.tts.xtts import XttsBackend
-
-        return XttsBackend(device=device)
-    if name == "openvoice":
-        from ytdub.stages.tts.openvoice_v2 import OpenVoiceV2Backend
-
-        return OpenVoiceV2Backend(device=device)
-    if name == "chatterbox":
-        from ytdub.stages.tts.chatterbox import ChatterboxBackend
-
-        return ChatterboxBackend(device=device)
-    raise ValueError(
-        f"Unknown TTS backend: {name!r} (expected 'xtts', 'chatterbox' or 'openvoice')"
-    )
+def tts_class(name: str) -> type:
+    return load_class(name, BUILTIN, "TTS")
 
 
-def synthesize_segments(
+def get_tts(name: str, settings) -> TTSBackend:
+    return tts_class(name)(settings)
+
+
+def spoken_chars(text: str) -> int:
+    """Letters, digits and combining marks (so Devanagari vowel signs count)."""
+    return sum(1 for c in text if unicodedata.category(c)[0] in "LNM")
+
+
+def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
+                          max_gap: float = 1.5) -> tuple[list[Segment], list[int]]:
+    """Merge lines with fewer than ``min_chars`` spoken characters into a neighbour.
+
+    Chatterbox's alignment analyzer takes a max over an empty slice on very short text
+    (``IndexError: max(): Expected reduction dim 1 to have non-zero size``); padding
+    with punctuation does not help. Merging preserves the words, adds no stutter and
+    also frees a little timeline.
+
+    Only an *adjacent* segment of the *same* speaker within ``max_gap`` seconds is a
+    valid target (preferring the previous one), so speech order is never changed.
+    Returns ``(segments, unmergeable_indices)``; unmergeable fragments are kept and
+    synthesized alone, and reported if that fails.
+    """
+    segs = [replace(s, sources=s.sources or [s.index]) for s in segments]
+
+    def joinable(a: Segment, b: Segment) -> bool:
+        return a.speaker == b.speaker and b.start - a.end <= max_gap
+
+    def merged(a: Segment, b: Segment) -> Segment:
+        confs = [c for c in (a.confidence, b.confidence) if c is not None]
+        return replace(
+            a, end=max(a.end, b.end), text=f"{a.text} {b.text}".strip(),
+            translated=f"{a.speech_text} {b.speech_text}".strip(),
+            confidence=min(confs) if confs else None, sources=a.sources + b.sources,
+        )
+
+    stuck: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for i, seg in enumerate(segs):
+            if spoken_chars(seg.speech_text) >= min_chars or seg.sources[0] in stuck:
+                continue
+            if i > 0 and joinable(segs[i - 1], seg):
+                segs[i - 1:i + 1] = [merged(segs[i - 1], seg)]
+            elif i + 1 < len(segs) and joinable(seg, segs[i + 1]):
+                segs[i:i + 2] = [merged(seg, segs[i + 1])]
+            else:
+                stuck.add(seg.sources[0])
+                continue
+            changed = True
+            break
+    for i, seg in enumerate(segs):
+        seg.index = i
+    for seg in segs:
+        if len(seg.sources) > 1:
+            log.info(f"merged short fragment(s) into line {seg.index}: {seg.speech_text!r}")
+    return segs, sorted(stuck)
+
+
+def clip_key(text: str, language: str, ref: SpeakerRef, ref_hash: str, tts: TTSBackend,
+             seed: int) -> str:
+    return hash_obj({"text": text, "lang": language, "ref": ref_hash, "tts": tts.name,
+                     "identity": tts.cache_identity(), "seed": seed})[:24]
+
+
+def _looks_broken(path: Path, text: str) -> str | None:
+    """Cheap sanity checks for the two common TTS failures: silence and runaway output."""
+    samples, sr = read_mono(path)
+    if len(samples) == 0 or float(abs(samples).max()) < 1e-3:
+        return "silent"
+    speech = trim_silence(samples, sr)
+    expected = spoken_chars(text) / 12.0  # generous: slow speech is ~12 chars/s
+    if len(speech) / sr > max(4.0, expected * 3.0):
+        return f"runaway ({len(speech) / sr:.1f}s for {spoken_chars(text)} chars)"
+    return None
+
+
+def synthesize_all(
     segments: list[Segment],
     tts: TTSBackend,
     *,
-    speaker_wavs: dict[str | None, Path],
+    refs: dict[str | None, SpeakerRef],
+    ref_hashes: dict[str | None, str],
     language: str,
-    out_dir: Path,
-) -> list[Segment]:
-    """Synthesize a per-segment audio clip in the cloned voice of the segment's speaker.
+    clip_dir: Path,
+    seed: int,
+    reuse: bool = True,
+) -> tuple[dict[int, Path], list[int]]:
+    """Synthesize (or reuse) a clip per segment. Returns ``(index -> clip, failed)``.
 
-    ``speaker_wavs`` maps a speaker label to its reference clip; ``None`` is the default
-    voice used for unlabeled segments (single-voice mode has just ``{None: clip}``).
-
-    Returns new segments with ``.audio_path`` set. Segments whose synthesis fails are
-    logged and left without audio (the sync stage will treat them as silence).
+    One failed line never aborts the language; its full traceback is logged and the
+    index returned in ``failed`` for the report. ``reuse=False`` (``--force``)
+    resynthesizes clips that already exist.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    default_wav = speaker_wavs.get(None) or next(iter(speaker_wavs.values()))
-
-    # Chatterbox's alignment analyzer crashes on very short utterances (its
-    # reduction window ends up empty). Merge tiny fragments into the next
-    # segment from the same speaker so no words are lost and nothing stutters.
-    _MIN_CHARS = 3
-    merged: list[Segment] = []
-    carry = ""
-    carry_speaker = None
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    default = next(iter(refs))
+    clips: dict[int, Path] = {}
+    failed: list[int] = []
+    todo = []
     for seg in segments:
-        text = (seg.translated or seg.text).strip()
-        if carry and seg.speaker == carry_speaker:
-            text = f"{carry} {text}".strip()
-            carry = ""
-            carry_speaker = None
-        if len(text.rstrip(".,!?…")) < _MIN_CHARS:
-            carry = text
-            carry_speaker = seg.speaker
-            continue
-        merged.append(seg.with_translation(text))
-    if carry:
-        for i in range(len(merged) - 1, -1, -1):
-            if merged[i].speaker == carry_speaker:
-                prev = (merged[i].translated or merged[i].text).strip()
-                merged[i] = merged[i].with_translation(f"{prev} {carry}")
-                carry = ""
-                break
-        if carry:
-            log.info(f"Dropping trailing fragment too short to synthesize: {carry!r}")
-    segments = merged
+        spk = seg.speaker if seg.speaker in refs else default
+        key = clip_key(seg.speech_text, language, refs[spk], ref_hashes[spk], tts, seed)
+        path = clip_dir / f"{key}.wav"
+        if reuse and path.exists():
+            clips[seg.index] = path
+        else:
+            todo.append((seg, spk, path))
+    if clips:
+        log.info(f"[{language}] {len(clips)}/{len(segments)} clips reused from cache")
 
-    out: list[Segment] = []
-    for seg in segments:
-        text = seg.translated or seg.text
-        speaker_wav = speaker_wavs.get(seg.speaker, default_wav)
-        clip = out_dir / f"seg_{seg.index:04d}.wav"
+    started = time.monotonic()
+    for n, (seg, spk, path) in enumerate(todo, start=1):
+        text = seg.speech_text
         try:
-            tts.synthesize(text, speaker_wav, language, clip)
-            out.append(seg.with_audio(clip))
-        except Exception as exc:
-            log.exception(f"TTS failed for segment {seg.index} ({text[:40]!r}): {exc}")
-            out.append(seg)
-    log.success(f"Synthesized {sum(s.audio_path is not None for s in out)}/{len(out)} segments")
-    return out
+            tmp = path.with_name(path.stem + ".tmp.wav")
+            problem = None
+            for attempt in range(2):
+                tts.synthesize(text, refs[spk].path, language, tmp, seed + attempt)
+                problem = _looks_broken(tmp, text)
+                if not problem:
+                    break
+                log.warning(f"[{language}] line {seg.index}: {problem}, retrying with new seed")
+            if problem:
+                log.warning(f"[{language}] line {seg.index}: still {problem}; keeping it")
+            tmp.replace(path)
+            clips[seg.index] = path
+        except Exception:
+            log.exception(f"[{language}] TTS failed for line {seg.index} ({text[:60]!r})")
+            failed.append(seg.index)
+        elapsed = time.monotonic() - started
+        eta = elapsed / n * (len(todo) - n)
+        log.info(f"[{language}] synthesized line {n}/{len(todo)} "
+                 f"({100 * n / len(todo):.0f}%) | elapsed {elapsed / 60:.1f}m | "
+                 f"eta {eta / 60:.1f}m")
+    return clips, failed

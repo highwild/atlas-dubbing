@@ -235,3 +235,6 @@ compare/
 *.srt
 cookies.txt
 nohup.out
+
+# pipeline working data (caches, clips, references)
+/work/

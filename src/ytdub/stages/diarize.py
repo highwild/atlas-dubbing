@@ -1,30 +1,33 @@
-"""Diarization stage — *who* speaks *when* (optional, for multi-voice dubbing).
+"""Diarization: who speaks when (only with ``--speakers``).
 
-When enabled, we tag every transcribed segment with a speaker label, then clone one voice
-per speaker — so a multi-speaker video comes out dubbed in *multiple* voices.
+Runs ONCE per source file and is cached; every language reuses the same labels and
+the same speaker -> reference-clip mapping, so a person keeps their own cloned voice
+in every language.
 
-Two backends:
-  * ``embedding`` (**default, token-free**) — embed each segment's audio with a speaker
-    encoder and cluster them. No gated models, no Hugging Face token: it keeps the
-    "runs free for everyone" promise. Pass the speaker count with ``--speakers`` or let
-    it auto-estimate.
-  * ``pyannote`` — pyannote speaker-diarization-3.1. More accurate, but needs a free HF
-    token and one-time terms acceptance.
+Backends:
+  * ``embedding`` (default, token-free): Resemblyzer speaker embeddings per segment,
+    then clustering. Apache-2.0, no Hugging Face account needed.
+  * ``pyannote``: more accurate, but needs an HF token and terms acceptance, so it is
+    offered, never required.
 
-The clustering (:func:`cluster_embeddings`) and overlap-matching (:func:`assign_speakers`)
-are pure and unit-tested; only the model calls need heavy dependencies.
+:func:`cluster_embeddings`, :func:`assign_speakers` and :func:`fill_short_labels` are
+pure and unit-tested.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ytdub.logging import stage_logger
 from ytdub.models import Segment
 
 log = stage_logger("diarize")
+
+# Embeddings of very short utterances are unreliable; those segments take the label
+# of the nearest segment in time instead.
+MIN_EMBED_SECONDS = 0.8
 
 
 @dataclass
@@ -35,100 +38,37 @@ class SpeakerTurn:
 
 
 def assign_speakers(segments: list[Segment], turns: list[SpeakerTurn]) -> list[Segment]:
-    """Tag each segment with the speaker whose turns overlap it most.
-
-    Pure function: given transcription segments and diarization turns (both on the same
-    timeline, in seconds), return new segments with ``.speaker`` set. A segment with no
-    overlap falls back to the nearest turn's speaker, so nothing is left unlabeled.
-    """
+    """Tag each segment with the speaker whose turns overlap it most (nearest if none)."""
     if not turns:
         return segments
-
-    out: list[Segment] = []
+    out = []
     for seg in segments:
-        best_speaker: str | None = None
-        best_overlap = 0.0
+        best, best_overlap = None, 0.0
         for turn in turns:
             overlap = min(seg.end, turn.end) - max(seg.start, turn.start)
             if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = turn.speaker
-
-        if best_speaker is None:  # no overlap -> nearest turn by midpoint distance
+                best, best_overlap = turn.speaker, overlap
+        if best is None:
             mid = (seg.start + seg.end) / 2
-            best_speaker = min(
-                turns, key=lambda t: abs((t.start + t.end) / 2 - mid)
-            ).speaker
-
-        out.append(
-            Segment(
-                index=seg.index,
-                start=seg.start,
-                end=seg.end,
-                text=seg.text,
-                translated=seg.translated,
-                audio_path=seg.audio_path,
-                speaker=best_speaker,
-            )
-        )
+            best = min(turns, key=lambda t: abs((t.start + t.end) / 2 - mid)).speaker
+        out.append(replace(seg, speaker=best))
     return out
 
 
-def diarize(audio_path: Path, *, device: str = "cpu", hf_token: str | None = None) -> list[SpeakerTurn]:
-    """Run pyannote speaker diarization and return the speaker turns.
-
-    Requires ``pip install 'ytdub[diarize-pyannote]'`` and a Hugging Face token (env
-    ``HF_TOKEN``) after accepting the model terms at hf.co/pyannote/speaker-diarization-3.1.
-    """
-    from pyannote.audio import Pipeline  # lazy, heavy
-
-    token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "Diarization needs a Hugging Face token. Accept the terms at "
-            "hf.co/pyannote/speaker-diarization-3.1 and set HF_TOKEN."
-        )
-
-    log.info("Loading pyannote speaker-diarization-3.1")
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", use_auth_token=token
-    )
-    if device in ("cuda", "mps"):
-        import torch
-
-        pipeline.to(torch.device(device))
-
-    diarization = pipeline(str(audio_path))
-    turns = [
-        SpeakerTurn(start=float(turn.start), end=float(turn.end), speaker=str(speaker))
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
-    ]
-    n_speakers = len({t.speaker for t in turns})
-    log.success(f"{len(turns)} turns across {n_speakers} speaker(s)")
-    return turns
-
-
-# --- Token-free embedding diarization --------------------------------------
-
-
 def cluster_embeddings(embeddings, num_speakers: int = 0, threshold: float = 0.75) -> list[int]:
-    """Cluster L2-normalizable speaker embeddings into speaker labels (pure, unit-tested).
-
-    ``num_speakers`` > 0 forces that many clusters (deterministic cosine k-means); 0
-    auto-estimates via average-linkage agglomerative merging until the closest two
-    clusters are less similar than ``threshold``. Returns a label per embedding.
-    """
+    """Cluster speaker embeddings. ``num_speakers`` > 0 forces k (cosine k-means with
+    farthest-point seeding); 0 auto-estimates by average-linkage merging until the two
+    closest clusters are less similar than ``threshold``."""
     import numpy as np
 
     x = np.asarray(embeddings, dtype=np.float64)
     n = len(x)
     if n <= 1:
         return [0] * n
-    x = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-9)  # unit vectors -> dot == cosine
+    x = x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-9)
 
     if num_speakers and num_speakers >= 1:
         k = min(num_speakers, n)
-        # Deterministic k-means++ style seeding (farthest-point), then Lloyd iterations.
         centroids = [x[0]]
         for _ in range(1, k):
             dist = 1.0 - (x @ np.array(centroids).T).max(axis=1)
@@ -147,7 +87,6 @@ def cluster_embeddings(embeddings, num_speakers: int = 0, threshold: float = 0.7
                     c[j] = m / (np.linalg.norm(m) + 1e-9)
         return labels.tolist()
 
-    # Auto: average-linkage agglomerative clustering by cosine similarity.
     clusters = [[i] for i in range(n)]
     while len(clusters) > 1:
         best_sim, bi, bj = -1.0, -1, -1
@@ -167,37 +106,75 @@ def cluster_embeddings(embeddings, num_speakers: int = 0, threshold: float = 0.7
     return labels
 
 
-def assign_speakers_by_embedding(
-    audio_path: Path, segments: list[Segment], *, num_speakers: int = 0, device: str = "cpu"
-) -> list[Segment]:
-    """Tag segments with speaker labels using a speaker encoder + clustering (no HF token).
+def fill_short_labels(segments: list[Segment], labels: dict[int, int]) -> list[int]:
+    """Label per segment; segments missing from ``labels`` take the nearest labelled one."""
+    labelled = [s for s in segments if s.index in labels]
+    out = []
+    for seg in segments:
+        if seg.index in labels:
+            out.append(labels[seg.index])
+            continue
+        mid = (seg.start + seg.end) / 2
+        nearest = min(labelled, key=lambda s: abs((s.start + s.end) / 2 - mid))
+        out.append(labels[nearest.index])
+    return out
 
-    Embeds each segment's audio slice with Resemblyzer's voice encoder, clusters the
-    embeddings, and writes ``speaker`` labels like ``SPK0`` / ``SPK1``.
-    """
+
+def diarize_embedding(audio_path: Path, segments: list[Segment], *, num_speakers: int = 0,
+                      device: str = "cpu") -> list[Segment]:
     import numpy as np
-    from pydub import AudioSegment
     from resemblyzer import VoiceEncoder, preprocess_wav
 
-    encoder = VoiceEncoder(device if device in ("cuda", "cpu") else "cpu")
-    audio = AudioSegment.from_file(audio_path).set_channels(1).set_frame_rate(16000)
+    from ytdub.audio import read_mono, resample
+    from ytdub.gpu import free_memory
 
-    embeddings = []
-    for seg in segments:
-        clip = audio[int(seg.start * 1000) : int(seg.end * 1000)]
-        samples = np.array(clip.get_array_of_samples()).astype(np.float32)
-        if clip.sample_width == 2:
-            samples /= 32768.0
-        wav = preprocess_wav(samples, source_sr=16000)
-        embeddings.append(encoder.embed_utterance(wav))
+    samples, sr = read_mono(audio_path)
+    if sr != 16000:
+        samples, sr = resample(samples, sr, 16000), 16000
+    encoder = VoiceEncoder("cuda" if device == "cuda" else "cpu")
+    try:
+        embeddable = [s for s in segments if s.duration >= MIN_EMBED_SECONDS] or segments
+        embeddings = []
+        for seg in embeddable:
+            clip = samples[int(seg.start * sr):int(seg.end * sr)]
+            wav = preprocess_wav(clip.astype(np.float32), source_sr=sr)
+            if len(wav) < sr * 0.3:  # VAD trimmed almost everything; use the raw slice
+                wav = clip.astype(np.float32)
+            embeddings.append(encoder.embed_utterance(wav))
+    finally:
+        del encoder
+        free_memory()
+    raw = cluster_embeddings(embeddings, num_speakers=num_speakers)
+    labels = fill_short_labels(segments, {s.index: lbl for s, lbl in zip(embeddable, raw)})
+    out = [replace(s, speaker=f"SPK{lbl}") for s, lbl in zip(segments, labels)]
+    counts = {f"SPK{k}": labels.count(k) for k in sorted(set(labels))}
+    log.success(f"{len(counts)} voice(s): {counts}")
+    return out
 
-    labels = cluster_embeddings(embeddings, num_speakers=num_speakers)
-    n = len(set(labels))
-    log.success(f"Embedding diarization: {n} voice(s) across {len(segments)} segments")
-    return [
-        Segment(
-            index=s.index, start=s.start, end=s.end, text=s.text,
-            translated=s.translated, audio_path=s.audio_path, speaker=f"SPK{labels[i]}",
-        )
-        for i, s in enumerate(segments)
-    ]
+
+def diarize_pyannote(audio_path: Path, segments: list[Segment], *, num_speakers: int = 0,
+                     device: str = "cpu", hf_token: str | None = None) -> list[Segment]:
+    from pyannote.audio import Pipeline
+
+    from ytdub.gpu import free_memory
+
+    token = hf_token or os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError("pyannote diarization needs a Hugging Face token (HF_TOKEN) and "
+                           "accepted terms at hf.co/pyannote/speaker-diarization-3.1")
+    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+    if device == "cuda":
+        import torch
+
+        pipeline.to(torch.device("cuda"))
+    kwargs = {"num_speakers": num_speakers} if num_speakers else {}
+    try:
+        result = pipeline(str(audio_path), **kwargs)
+        turns = [SpeakerTurn(float(t.start), float(t.end), str(spk))
+                 for t, _, spk in result.itertracks(yield_label=True)]
+    finally:
+        del pipeline
+        free_memory()
+    names = {spk: f"SPK{i}" for i, spk in enumerate(sorted({t.speaker for t in turns}))}
+    turns = [SpeakerTurn(t.start, t.end, names[t.speaker]) for t in turns]
+    return assign_speakers(segments, turns)

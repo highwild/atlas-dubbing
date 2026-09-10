@@ -1,66 +1,97 @@
-"""Chatterbox Multilingual backend (Resemble AI) — MIT, modern, high fidelity.
-
-A cleaner, higher-quality alternative to XTTS/OpenVoice: MIT-licensed, ``pip install
-chatterbox-tts`` with no legacy dependency pins, 23 languages, zero-shot cloning, and an
-emotion-exaggeration control. In 2026 blind tests it clones more naturally than XTTS-v2.
-
-Enabled with ``pip install 'ytdub[chatterbox]'`` and ``--tts chatterbox``.
-"""
+"""Chatterbox Multilingual (Resemble AI, MIT) voice-cloning backend."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from ytdub.logging import stage_logger
 
 log = stage_logger("tts")
 
-# Chatterbox Multilingual language ids (ISO-639-1) — the ones we map targets to.
-_SUPPORTED = {
+# Mirrors chatterbox.mtl_tts.SUPPORTED_LANGUAGES (0.1.7) so languages can be validated
+# before hours of work, without importing torch.
+SUPPORTED_LANGUAGES = {
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
     "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh",
 }
 
 
+def _import_chatterbox():
+    """Import Chatterbox, surfacing the failures that are otherwise silent.
+
+    ``perth`` (the watermarker) imports ``pkg_resources``; setuptools 81+ removed it,
+    perth swallows the ImportError and sets ``PerthImplicitWatermarker = None``, and
+    every generate call then dies with "'NoneType' object is not callable". Check it
+    here and say what is actually wrong.
+    """
+    # Chatterbox's per-step tqdm bar counts tokens against a 1000-token ceiling a
+    # sentence never reaches and reads as "stuck". Our own per-line progress replaces it.
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    try:
+        import perth
+    except ImportError as exc:
+        raise ImportError(f"resemble-perth (Chatterbox watermarker) failed to import: {exc}") from exc
+    if getattr(perth, "PerthImplicitWatermarker", None) is None:
+        try:
+            import pkg_resources  # noqa: F401
+            cause = "unknown (pkg_resources imports fine)"
+        except ImportError as exc:
+            cause = f"pkg_resources is missing ({exc}); install 'setuptools<80'"
+        raise ImportError(f"perth.PerthImplicitWatermarker is None. Cause: {cause}")
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+    return ChatterboxMultilingualTTS
+
+
 class ChatterboxBackend:
-    def __init__(self, device: str = "cpu", exaggeration: float = 0.5) -> None:
-        self.device = "cuda" if device == "cuda" else "cpu"
-        self.exaggeration = exaggeration
+    name = "chatterbox-multilingual"
+    supported_languages = SUPPORTED_LANGUAGES
+
+    def __init__(self, settings) -> None:
+        self.device = "cuda" if settings.device == "cuda" else "cpu"
+        self.exaggeration = settings.tts_exaggeration
+        self.cfg_weight = settings.tts_cfg_weight
+        self.temperature = settings.tts_temperature
         self._model = None
+
+    def cache_identity(self) -> dict:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            pkg = version("chatterbox-tts")
+        except PackageNotFoundError:
+            pkg = "unknown"
+        return {"model": "ChatterboxMultilingualTTS", "chatterbox_tts": pkg,
+                "exaggeration": self.exaggeration, "cfg_weight": self.cfg_weight,
+                "temperature": self.temperature}
 
     def _get_model(self):
         if self._model is None:
-            import torch
-            from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # lazy
-
-            log.info(f"Loading Chatterbox Multilingual on {self.device} (first run downloads weights)")
-            if self.device == "cpu" and not torch.cuda.is_available():
-                # Some chatterbox-tts builds torch.load a CUDA-saved tensor without a
-                # map_location; force CPU so it loads on a GPU-less machine.
-                _orig = torch.load
-                torch.load = lambda *a, **k: _orig(*a, **{**k, "map_location": "cpu"})
-                try:
-                    self._model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
-                finally:
-                    torch.load = _orig
-            else:
-                self._model = ChatterboxMultilingualTTS.from_pretrained(device=self.device)
+            cls = _import_chatterbox()
+            log.info(f"Loading Chatterbox Multilingual on {self.device}")
+            self._model = cls.from_pretrained(device=self.device)
         return self._model
 
-    def synthesize(self, text: str, speaker_wav: Path, language: str, out_path: Path) -> Path:
-        if language not in _SUPPORTED:
-            raise ValueError(
-                f"Chatterbox does not support language {language!r}. Supported: {sorted(_SUPPORTED)}"
-            )
-        import torchaudio as ta
+    def synthesize(self, text: str, ref: Path, language: str, out_path: Path, seed: int) -> Path:
+        if language not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Chatterbox does not support {language!r}")
+        import torch
+
+        from ytdub.audio import write_wav
 
         model = self._get_model()
+        torch.manual_seed(seed)
         wav = model.generate(
-            text,
-            language_id=language,
-            audio_prompt_path=str(speaker_wav),
-            exaggeration=self.exaggeration,
+            text, language_id=language, audio_prompt_path=str(ref),
+            exaggeration=self.exaggeration, cfg_weight=self.cfg_weight,
+            temperature=self.temperature,
         )
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        ta.save(str(out_path), wav, model.sr)
+        write_wav(out_path, wav.squeeze(0).detach().cpu().numpy(), model.sr, subtype="FLOAT")
         return out_path
+
+    def unload(self) -> None:
+        from ytdub.gpu import free_memory
+
+        self._model = None
+        free_memory()

@@ -1,65 +1,56 @@
 [project]
 name = "ytdub"
-version = "0.2.0"
-description = "Local-first, fully open-source YouTube dubbing with voice cloning and time-aligned synthesis."
+version = "0.3.0"
+description = "Local voice-cloning dubbing pipeline: exact-duration dubbed audio tracks for YouTube."
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+# Pinned to the deployment target. Chatterbox, torch 2.6 and faster-whisper/ctranslate2
+# are resolved and locked (uv.lock) for exactly this version; don't widen it without
+# re-locking and re-testing on the target box.
+requires-python = "==3.11.*"
 license = { text = "MIT" }
-authors = [{ name = "Saverio Mazza" }]
 
-# Core dependencies: everything needed to run the pipeline locally, for free,
-# on CPU (a GPU is used automatically if present). The heavy TTS engines live in
-# optional extras so the base install stays light and installs everywhere.
+# Core: everything the pure stages (fitting, prompts, cache, SRT) need. Light enough to
+# run the unit tests anywhere, with no GPU, models or ffmpeg.
 dependencies = [
-    "yt-dlp>=2025.1.15",        # robust YouTube download (replaces pytube/youtube-dl)
-    "faster-whisper>=1.1.0",    # ASR with word-level timestamps (CTranslate2, CPU-friendly)
-    "argostranslate>=1.9.6",    # fully offline MT (default translator, CPU)
-    "pydub>=0.25.1",            # audio segment manipulation
-    "soundfile>=0.12.1",        # wav I/O
-    "numpy>=1.24",
-    "typer>=0.12.0",            # the CLI (`ytdub ...`)
+    "numpy>=1.24",              # chatterbox-tts caps this at <2 on Python < 3.13
+    "scipy>=1.11",              # HiGHS LP solver for timeline fitting; polyphase resampling
+    "soundfile>=0.12.1",
     "loguru>=0.7.2",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
-    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]
-# Default cloning TTS: Coqui XTTS-v2 (multilingual, CPU-capable).
-# The two pins below are load-bearing for coqui-tts and prevent the most common
-# install breakages (verified July 2026):
-#   * transformers 5.x removed `isin_mps_friendly`, which coqui-tts imports.
-#   * the numba/librosa stack needs numpy < 2.1.
-# For CPU machines also install torch < 2.9 (see the README "CPU recipe") to avoid
-# torchcodec, whose wheel pulls CUDA libs that a CPU-only box can't load.
-xtts = [
-    "coqui-tts>=0.25.0",
-    "transformers>=4.43,<5",
-    "numpy<2.1",
+# The model stack for real runs (Linux + NVIDIA). Every model and library here permits
+# commercial use: faster-whisper (MIT) + Whisper weights (MIT), Chatterbox (MIT),
+# Resemblyzer (Apache-2.0), yt-dlp (Unlicense). Translation is Qwen3 via Ollama
+# (Apache-2.0), which is a separate install. NLLB (CC-BY-NC) and XTTS (CPML,
+# non-commercial) were removed for that reason.
+ml = [
+    "faster-whisper>=1.1.0",
+    # Chatterbox hard-pins torch/torchaudio 2.6.0, transformers 5.2.0 and diffusers
+    # 0.29.0 (as of 0.1.7). It is sensitive to both: pin chatterbox itself exactly and
+    # restate its pins here so a resolver never "upgrades" around them. Change all of
+    # these together, and only after a real synthesis test.
+    "chatterbox-tts==0.1.7",
+    "transformers==5.2.0",
+    "diffusers==0.29.0",
+    # perth (Chatterbox's watermarker) imports pkg_resources, removed in setuptools 81.
+    # Without it perth silently sets its watermarker to None and every TTS call fails
+    # with "'NoneType' object is not callable". The TTS backend also checks this at
+    # import time and names the cause.
+    "setuptools<80",
+    "resemblyzer>=0.1.4",       # token-free diarization
+    "yt-dlp>=2025.11.12",       # needs js_runtimes/remote_components for YouTube's JS challenge
 ]
-# Chatterbox Multilingual (Resemble AI) — MIT, cleaner install, higher fidelity than
-# XTTS. A strong alternative default: `--tts chatterbox`.
-chatterbox = ["chatterbox-tts>=0.1.1"]
-# NOTE: OpenVoice v2 has no working pip extra — `myshell-openvoice` hard-pins ancient
-# deps (faster-whisper==0.9.0) and `melotts` fails to build, so it can't resolve against
-# a modern stack. The `openvoice` TTS backend still works if you set it up in a dedicated
-# legacy environment by hand (see the README "OpenVoice" note). Prefer `chatterbox`/`xtts`.
-# Higher-quality neural MT alternative to Argos (heavier, pulls in torch).
-nllb = ["transformers>=4.44", "torch>=2.2", "sentencepiece>=0.2"]
-# Multi-voice, token-free (default): speaker-embedding clustering via Resemblyzer.
-diarize = ["resemblyzer>=0.1.4"]
-# Multi-voice, higher accuracy: pyannote (needs a free Hugging Face token).
-diarize-pyannote = ["pyannote.audio>=3.3", "torch>=2.2"]
-# Lip-sync (Wav2Lip) runs in its OWN environment via subprocess (its librosa pin
-# conflicts with coqui-tts), so there is no in-process extra to install here — see the
-# README "Lip-sync" section for the Wav2Lip setup.
-# Optional FastAPI server (the CLI is the primary entry point).
-api = ["fastapi>=0.115", "uvicorn>=0.30"]
-# Developer tooling.
+# Optional, more accurate diarization. Needs a Hugging Face token + terms acceptance.
+pyannote = ["pyannote.audio>=3.3"]
+# Optional vocal isolation for when only a full mix exists (a clean stem is better).
+separate = ["demucs>=4.0.1"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
-ytdub = "ytdub.cli:app"
+dub = "ytdub.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -70,9 +61,7 @@ packages = ["src/ytdub"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
-# Colab notebooks follow their own conventions (mid-cell imports, google.colab).
-extend-exclude = ["*.ipynb"]
+target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

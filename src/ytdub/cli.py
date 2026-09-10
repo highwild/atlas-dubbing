@@ -1,116 +1,168 @@
-"""``ytdub`` command-line interface — the primary, comfortable way to run this locally.
+"""``dub``: one command per job.
 
-    ytdub dub "https://youtu.be/VIDEO_ID" --target en
-    ytdub dub "https://youtu.be/VIDEO_ID" --source it --target es --tts openvoice
+    dub myfile.wav                              # all default languages
+    dub myfile.wav --style duo --speakers 2     # conversation, two voices
+    dub myfile.wav --style professional de fr   # subset of languages
+    dub                                         # usage + available styles
 
-The result is a share-ready MP4 (H.264 + AAC, faststart) under ``data/output/`` that you
-can send straight over WhatsApp/Telegram.
+Flags and languages may come in any order.
 """
 
 from __future__ import annotations
 
+import argparse
+import subprocess
+import sys
+import time
 from pathlib import Path
 
-import typer
-
-from ytdub import __version__
-from ytdub.config import Settings, detect_device
-from ytdub.logging import setup_logging
-
-app = typer.Typer(add_completion=False, help="Local-first open-source YouTube dubbing.")
+from ytdub.config import DEFAULT_LANGUAGES, Settings, available_styles
 
 
-@app.command()
-def dub(
-    url: str = typer.Argument(
-        ..., help="YouTube URL (watch/shorts/youtu.be) or a path to a local video file."
-    ),
-    target: str = typer.Option("en", "--target", "-t", help="Target language (ISO-639-1)."),
-    source: str | None = typer.Option(
-        None, "--source", "-s", help="Source language; omit to auto-detect."
-    ),
-    tts: str = typer.Option(
-        "chatterbox", "--tts", help="TTS backend: 'chatterbox' (MIT, default), 'xtts' or 'openvoice'."
-    ),
-    diarize: bool = typer.Option(
-        False, "--diarize", help="Multi-voice: detect speakers and clone one voice each."
-    ),
-    speakers: int = typer.Option(
-        0, "--speakers", help="Number of speakers for --diarize (0 = auto-estimate)."
-    ),
-    diarize_method: str = typer.Option(
-        "embedding", "--diarize-method",
-        help="'embedding' (token-free, default) or 'pyannote' (needs HF_TOKEN).",
-    ),
-    lipsync: bool = typer.Option(
-        False, "--lipsync", help="Re-render the mouth to match the dub (Wav2Lip; see README)."
-    ),
-    subtitles: bool = typer.Option(
-        False, "--subtitles", help="Burn small, bottom translated subtitles into the video."
-    ),
-    sub_size: int = typer.Option(14, "--sub-size", help="Burned subtitle font size."),
-    translator: str = typer.Option(
-        "argos", "--translator", help="Translator: 'argos' (offline) or 'nllb'."
-    ),
-    target_cps: float = typer.Option(
-        15.0, "--target-cps",
-        help="Length-aware target speaking rate (chars/sec) for NLLB; lower = more "
-        "concise translations & less time-stretch. 0 disables. Only affects NLLB.",
-    ),
-    asr_model: str = typer.Option(
-        "small", "--asr-model", help="Whisper size: tiny/base/small/medium/large-v3."
-    ),
-    data_dir: Path = typer.Option(
-        Path("data"), "--data-dir", help="Where downloads/work/output live."
-    ),
-    reencode: bool = typer.Option(
-        False, "--reencode", help="Force H.264 re-encode for max compatibility."
-    ),
-    cookies_from_browser: str | None = typer.Option(
-        None,
-        "--cookies-from-browser",
-        help="Use a browser's cookies if YouTube asks to 'confirm you're not a bot' "
-        "(e.g. chrome, firefox, edge).",
-    ),
-    cookies: Path | None = typer.Option(
-        None, "--cookies", help="Path to a Netscape-format cookies.txt for yt-dlp."
-    ),
-    log_level: str = typer.Option("INFO", "--log-level", help="DEBUG/INFO/WARNING/ERROR."),
-) -> None:
-    """Download a video and produce a dubbed, share-ready copy in another language."""
-    setup_logging(log_level)
-    from ytdub.pipeline import dub as run_dub
-
-    settings = Settings(
-        data_dir=data_dir.resolve(),
-        source_lang=source,
-        target_lang=target,
-        tts_backend=tts,
-        diarize=diarize,
-        diarize_method=diarize_method,
-        num_speakers=speakers,
-        lipsync=lipsync,
-        burn_subtitles=subtitles,
-        subtitle_font_size=sub_size,
-        translator=translator,
-        target_chars_per_sec=target_cps,
-        asr_model=asr_model,
-        reencode_video=reencode,
-        cookies_from_browser=cookies_from_browser,
-        cookies_file=cookies,
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="dub", description="Dub a video or audio file into other languages in the "
+        "speaker's own cloned voice. Runs entirely locally.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    result = run_dub(url, settings)
-    typer.secho(f"\n✅ Dubbed video: {result.output_path}", fg=typer.colors.GREEN, bold=True)
-    if result.subtitle_path:
-        typer.secho(f"   Subtitles:    {result.subtitle_path}", fg=typer.colors.GREEN)
+    p.add_argument("input", nargs="?", help="file in input/ (or a path, or a YouTube URL)")
+    p.add_argument("langs", nargs="*", help=f"target languages (default: {' '.join(DEFAULT_LANGUAGES)})")
+    job = p.add_argument_group("job")
+    job.add_argument("--style", help="style preset from synopses/ (default: casual)")
+    job.add_argument("--speakers", type=int, metavar="N",
+                     help="multi-voice mode with N speakers (0 = auto-detect)")
+    job.add_argument("--source", metavar="LANG", help="source language (default: auto-detect)")
+    job.add_argument("--ref", action="append", default=[], metavar="[SPK=]PATH",
+                     help="voice reference clip, e.g. --ref atlas.wav or --ref SPK1=guest.wav")
+    review = p.add_argument_group("review loop")
+    review.add_argument("--srt-only", action="store_true",
+                        help="stop after translation; write <lang>.review.srt for checking")
+    review.add_argument("--from-review", action="store_true",
+                        help="dub from the (edited) <lang>.review.srt files, skipping translation")
+    cache = p.add_argument_group("cache")
+    cache.add_argument("--force", "--no-cache", dest="force", action="store_true",
+                       help="ignore every cached result and recompute")
+    tune = p.add_argument_group("tuning")
+    tune.add_argument("--separate", action="store_true",
+                      help="isolate vocals with demucs first (only for full mixes)")
+    tune.add_argument("--asr-model", help="Whisper size name or local model directory")
+    tune.add_argument("--ollama-model", help="translation model (default qwen3:8b)")
+    tune.add_argument("--tts", dest="tts_backend",
+                      help="TTS backend: 'chatterbox' or module.path:ClassName")
+    tune.add_argument("--translator", help="translator: 'ollama' or module.path:ClassName")
+    tune.add_argument("--num-ctx", type=int, dest="ollama_num_ctx", help="Ollama context window")
+    tune.add_argument("--max-ratio", type=float, help="compression cap (default 1.2)")
+    tune.add_argument("--max-delay", type=float, help="soft cap on lateness, seconds")
+    tune.add_argument("--cps", type=float, dest="chars_per_second",
+                      help="speaking rate for translation budgets (default 15)")
+    tune.add_argument("--min-confidence", type=float,
+                      help="drop transcribed segments below this mean word probability")
+    tune.add_argument("--loudness-ref", dest="loudness_reference", metavar="PATH",
+                      help="match loudness to this file (e.g. the full mix when dubbing a stem)")
+    tune.add_argument("--no-loudness", action="store_true", help="skip loudness matching")
+    tune.add_argument("--no-mux", action="store_true", help="never write the preview .mp4")
+    tune.add_argument("--device", help="cuda or cpu (default: auto)")
+    net = p.add_argument_group("network / running")
+    net.add_argument("--allow-ipv6", action="store_true", help="do not force IPv4")
+    net.add_argument("--cookies-from-browser", metavar="BROWSER", help="yt-dlp cookies source")
+    net.add_argument("--detach", action="store_true",
+                     help="run in the background, surviving SSH disconnects; logs to output/")
+    net.add_argument("--log-level", default="INFO")
+    return p
 
 
-@app.command()
-def info() -> None:
-    """Print version and the auto-detected compute device."""
-    typer.echo(f"ytdub {__version__}")
-    typer.echo(f"device: {detect_device()}")
+def _usage(p: argparse.ArgumentParser, settings: Settings) -> None:
+    p.print_help()
+    styles = available_styles(settings.styles_dir)
+    print("\nAvailable styles:" + ("".join(f"\n  {s}" for s in styles) or "\n  (none found in "
+                                   f"{settings.styles_dir})"))
+    if settings.input_dir.is_dir():
+        files = sorted(f.name for f in settings.input_dir.iterdir() if f.is_file())
+        print(f"\nFiles in {settings.input_dir}:" + ("".join(f"\n  {f}" for f in files) or "\n  (empty)"))
+    print("\nExamples:\n  dub solo.wav\n  dub chat.wav --style duo --speakers 2\n"
+          "  dub doc.wav --style professional de fr\n  dub talk.wav --srt-only de pl   "
+          "# then edit output/talk/de.review.srt\n  dub talk.wav --from-review de pl")
+
+
+def _parse_refs(values: list[str]) -> dict[str | None, Path]:
+    refs: dict[str | None, Path] = {}
+    for v in values:
+        spk, _, path = v.rpartition("=") if "=" in v else ("", "", v)
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"--ref: {p} not found")
+        refs[spk or None] = p.resolve()
+    return refs
+
+
+def _detach(argv: list[str], settings: Settings, input_arg: str) -> int:
+    log_dir = settings.output_root / Path(input_arg).stem
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"dub-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    args = [a for a in argv if a != "--detach"]
+    with open(log_path, "ab") as fh:
+        proc = subprocess.Popen([sys.executable, "-m", "ytdub.cli", *args], stdout=fh,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+    print(f"Running detached (pid {proc.pid}); safe to disconnect.\n  tail -f {log_path}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = _parser()
+    args = parser.parse_intermixed_args(argv)
+
+    overrides = {k: v for k, v in {
+        "style": args.style, "speakers": args.speakers, "source_lang": args.source,
+        "asr_model": args.asr_model, "ollama_model": args.ollama_model,
+        "ollama_num_ctx": args.ollama_num_ctx, "max_ratio": args.max_ratio,
+        "max_delay": args.max_delay, "chars_per_second": args.chars_per_second,
+        "min_confidence": args.min_confidence, "loudness_reference": args.loudness_reference,
+        "device": args.device, "cookies_from_browser": args.cookies_from_browser,
+        "tts_backend": args.tts_backend, "translator": args.translator,
+    }.items() if v is not None}
+    if args.langs:
+        overrides["languages"] = [lang.lower() for lang in args.langs]
+    for flag, key, value in ((args.force, "force", True), (args.separate, "separate", True),
+                             (args.no_loudness, "match_loudness", False),
+                             (args.no_mux, "mux_video", False),
+                             (args.allow_ipv6, "force_ipv4", False)):
+        if flag:
+            overrides[key] = value
+    settings = Settings(**overrides)
+
+    if not args.input:
+        _usage(parser, settings)
+        return 1
+    styles = available_styles(settings.styles_dir)
+    if settings.style not in styles:
+        print(f"No style called {settings.style!r}. Available: {', '.join(styles) or 'none'}")
+        return 1
+    if args.srt_only and args.from_review:
+        print("--srt-only and --from-review are mutually exclusive")
+        return 1
+    if not args.srt_only:
+        from ytdub.stages.tts.base import tts_class
+
+        supported = tts_class(settings.tts_backend).supported_languages
+        bad = [lang for lang in settings.languages if lang not in supported]
+        if bad:
+            print(f"Unsupported by the {settings.tts_backend} TTS: {', '.join(bad)}. "
+                  f"Supported: {' '.join(sorted(supported))}")
+            return 1
+    refs = _parse_refs(args.ref)
+    if args.detach:
+        return _detach(argv, settings, args.input)
+
+    from ytdub.logging import setup_logging
+    from ytdub.pipeline import run_job
+
+    setup_logging(args.log_level.upper(), force=True)
+    results = run_job(settings, args.input, srt_only=args.srt_only,
+                      from_review=args.from_review, user_refs=refs)
+    return 0 if all(r.status in ("ok", "srt-only") for r in results) else 1
 
 
 if __name__ == "__main__":
-    app()
+    sys.exit(main())

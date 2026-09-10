@@ -10,3 +10,10 @@ Translate so it sounds like a natural conversation between friends in the target
 language. Keep the back-and-forth energy. Reactions and interjections should
 become the natural equivalent, not a literal translation - short exclamations
 especially.
+
+Locale rules:
+- Numbers: spell every number out as words, the way it would be said aloud. No digits.
+- Currency: keep pounds as pounds (spelled out); do not convert. In-game currencies
+  are names and stay untranslated.
+- Dates: use the target language's normal spoken order.
+- Units: keep miles and mph as they are - they match what is shown on screen.

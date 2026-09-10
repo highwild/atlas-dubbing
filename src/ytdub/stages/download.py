@@ -1,12 +1,13 @@
-"""Download stage — powered by yt-dlp.
+"""Acquire a source from a URL via yt-dlp (local files skip this entirely).
 
-Replaces the old ``pytube`` + ``youtube-dl`` combo, both of which break whenever
-YouTube rotates its signatures. yt-dlp is the actively-maintained standard and is a
-pure-Python pip dependency (it shells out to the ffmpeg we already require for muxing).
+Two traps, both handled here in the single options dict used for every call:
 
-We fetch two artifacts:
-  * the best MP4 video+audio stream (kept for the final mux), and
-  * a clean 16 kHz mono WAV of the audio (what the ASR and voice-cloning stages want).
+* YouTube's JS challenge needs a JS runtime (Node) enabled plus yt-dlp's remote solver
+  components, or downloads hang at "Downloading webpage".
+* yt-dlp used as a *library* ignores ``~/.config/yt-dlp/config``, so nothing there
+  applies. The reference implementation had two option dicts and fixing one gave a
+  confusing partial failure; there is now exactly one (:func:`ydl_options`) and only
+  one download call, since audio is extracted from the result with ffmpeg afterwards.
 """
 
 from __future__ import annotations
@@ -15,29 +16,38 @@ import re
 from pathlib import Path
 
 from ytdub.logging import stage_logger
-from ytdub.models import DownloadResult
 
 log = stage_logger("download")
 
 _ID_RE = re.compile(r"(?:v=|/shorts/|youtu\.be/|/)([0-9A-Za-z_-]{11})(?:[?&/]|$)")
 
 
+def is_url(value: str) -> bool:
+    return value.startswith(("http://", "https://"))
+
+
 def extract_video_id(url: str) -> str | None:
-    """Best-effort 11-char YouTube id extraction (watch, shorts, youtu.be, embed)."""
     match = _ID_RE.search(url)
     return match.group(1) if match else None
 
 
-def _cookie_opts(
-    cookies_from_browser: str | None, cookies_file: Path | None
-) -> dict:
-    """yt-dlp cookie options.
-
-    Some networks/IPs (datacenters, VPNs, CI) trigger YouTube's "confirm you're not a
-    bot" check; passing your browser's cookies is the standard fix. On a normal home
-    machine this is usually unnecessary.
-    """
-    opts: dict = {}
+def ydl_options(out_dir: Path, *, force_ipv4: bool = True, timeout: float = 60.0,
+                cookies_from_browser: str | None = None,
+                cookies_file: Path | None = None) -> dict:
+    opts: dict = {
+        "format": ("bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/best[vcodec^=avc1]/"
+                   "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"),
+        "merge_output_format": "mp4",
+        "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
+        "noprogress": True,
+        "no_warnings": False,
+        "socket_timeout": timeout,
+        "retries": 5,
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
+    }
+    if force_ipv4:
+        opts["source_address"] = "0.0.0.0"
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
     if cookies_file:
@@ -45,84 +55,16 @@ def _cookie_opts(
     return opts
 
 
-def download(
-    url: str,
-    downloads_dir: Path,
-    *,
-    cookies_from_browser: str | None = None,
-    cookies_file: Path | None = None,
-) -> DownloadResult:
-    """Download ``url`` and return the local video path plus a 16 kHz mono WAV.
+def download(url: str, out_dir: Path, **opts) -> Path:
+    """Download ``url`` into ``out_dir`` and return the media file path."""
+    import yt_dlp
 
-    yt-dlp handles shorts, age-gates, format selection and ffmpeg post-processing.
-    """
-    import yt_dlp  # lazy
-
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(downloads_dir / "%(id)s.%(ext)s")
-    cookie_opts = _cookie_opts(cookies_from_browser, cookies_file)
-
-    # First pass: grab the muxed MP4 we will later re-dub. Prefer H.264 (avc1) so the
-    # copied video stream plays everywhere (WhatsApp/older phones choke on AV1/VP9);
-    # fall back to any mp4, then anything.
-    video_opts = {
-        "format": (
-            "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/best[vcodec^=avc1]/"
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        ),
-        "merge_output_format": "mp4",
-        "outtmpl": outtmpl,
-        "quiet": False,
-        "no_warnings": True,
-        "noprogress": True,
-        "source_address": "0.0.0.0",
-        "js_runtimes": {"node": {}},
-        "remote_components": ["ejs:github"],
-        **cookie_opts,
-    }
-
-    log.info(f"Fetching video metadata + stream: {url}")
-    with yt_dlp.YoutubeDL(video_opts) as ydl:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log.info(f"Downloading {url}")
+    with yt_dlp.YoutubeDL(ydl_options(out_dir, **opts)) as ydl:
         info = ydl.extract_info(url, download=True)
-
-    video_id: str = info["id"]
-    title: str = info.get("title", video_id)
-    duration = float(info.get("duration") or 0.0)
-    video_path = downloads_dir / f"{video_id}.mp4"
-
-    # Second pass: extract a normalized 16 kHz mono WAV for ASR + voice cloning.
-    audio_path = downloads_dir / f"{video_id}.wav"
-    audio_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(downloads_dir / f"{video_id}.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "wav"},
-        ],
-        # 16 kHz mono is what Whisper/cloning models expect.
-        "postprocessor_args": {"extractaudio": ["-ar", "16000", "-ac", "1"]},
-        "source_address": "0.0.0.0",
-        "js_runtimes": {"node": {}},
-        "remote_components": ["ejs:github"],
-        **cookie_opts,
-    }
-
-    log.info("Extracting 16 kHz mono audio track")
-    with yt_dlp.YoutubeDL(audio_opts) as ydl:
-        ydl.extract_info(url, download=True)
-
-    if not video_path.exists():
-        raise FileNotFoundError(f"yt-dlp did not produce {video_path}")
-    if not audio_path.exists():
-        raise FileNotFoundError(f"yt-dlp did not produce {audio_path}")
-
-    log.success(f"Downloaded '{title}' ({duration:.0f}s) -> {video_path.name}")
-    return DownloadResult(
-        video_id=video_id,
-        title=title,
-        video_path=video_path,
-        audio_path=audio_path,
-        duration=duration,
-    )
+    path = out_dir / f"{info['id']}.mp4"
+    if not path.exists():
+        raise FileNotFoundError(f"yt-dlp did not produce {path}")
+    log.success(f"Downloaded {info.get('title', info['id'])!r} -> {path.name}")
+    return path

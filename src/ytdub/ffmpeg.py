@@ -1,150 +1,170 @@
-"""Small ffmpeg helpers shared by the sync and assemble stages.
+"""ffmpeg / ffprobe helpers.
 
-We depend on the ``ffmpeg`` binary (already required by yt-dlp for muxing) rather than
-on an extra Python DSP package, so the tool stays light and portable.
+Every call goes through :func:`run`, which raises with the tail of ffmpeg's stderr so a
+failure says why. Nothing here assumes the input has a video stream: callers probe
+first with :func:`probe` and branch on ``has_video``.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 
-def ensure_ffmpeg() -> str:
-    """Return the ffmpeg executable path or raise a clear, actionable error."""
-    exe = shutil.which("ffmpeg")
+
+def _exe(name: str) -> str:
+    exe = shutil.which(name)
     if not exe:
-        raise RuntimeError(
-            "ffmpeg not found on PATH. Install it (e.g. `sudo apt install ffmpeg`, "
-            "`brew install ffmpeg`, or from https://ffmpeg.org/download.html)."
-        )
+        raise RuntimeError(f"{name} not found on PATH. Install ffmpeg (sudo apt install ffmpeg).")
     return exe
 
 
-def _run(args: list[str]) -> None:
-    proc = subprocess.run(args, capture_output=True, text=True)
+def run(args: list[str]) -> subprocess.CompletedProcess:
+    proc = subprocess.run([_exe(args[0]), *args[1:]], capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed ({' '.join(args[:6])} ...):\n{proc.stderr[-2000:]}")
+        raise RuntimeError(f"{args[0]} failed: {' '.join(args[:8])} ...\n{proc.stderr[-3000:]}")
+    return proc
 
 
-def burn_subtitles(video: Path, srt: Path, out: Path, *, font_size: int = 14) -> Path:
-    """Burn an SRT into the video as small, bottom-centered captions (re-encodes video).
+@dataclass
+class Probe:
+    duration: float
+    has_video: bool
+    has_audio: bool
 
-    ``Alignment=2`` is bottom-center in libass; a thin outline keeps text readable over
-    any background. Audio is stream-copied; the result stays ``+faststart``.
-    """
-    ensure_ffmpeg()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    # Escape characters that the ffmpeg filtergraph treats specially in a filename.
-    srt_arg = str(srt).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-    style = (
-        f"FontName=DejaVu Sans,FontSize={font_size},"
-        "Alignment=2,MarginV=10,Outline=1,Shadow=0,BorderStyle=1"
-    )
-    _run([
-        "ffmpeg", "-y", "-i", str(video),
-        "-vf", f"subtitles={srt_arg}:force_style='{style}'",
-        "-c:a", "copy", "-movflags", "+faststart", str(out),
+
+def probe(path: Path) -> Probe:
+    """Container duration plus which stream types exist."""
+    proc = run([
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_entries", "format=duration:stream=codec_type", str(path),
     ])
+    data = json.loads(proc.stdout or "{}")
+    types = {s.get("codec_type") for s in data.get("streams", [])}
+    try:
+        duration = float(data.get("format", {}).get("duration", 0.0))
+    except (TypeError, ValueError):
+        duration = 0.0
+    return Probe(duration=duration, has_video="video" in types, has_audio="audio" in types)
+
+
+def extract_audio(src: Path, dst: Path, *, sample_rate: int, channels: int = 1) -> Path:
+    """Decode the first audio stream to a PCM WAV (``-vn``: works for audio-only input too)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp.wav")
+    run([
+        "ffmpeg", "-y", "-nostdin", "-i", str(src), "-map", "0:a:0", "-vn",
+        "-ar", str(sample_rate), "-ac", str(channels), "-c:a", "pcm_s16le", str(tmp),
+    ])
+    tmp.replace(dst)
+    return dst
+
+
+def atempo_chain(ratio: float) -> str:
+    """``atempo`` accepts 0.5-2.0 per instance; chain for anything outside that."""
+    ratio = max(0.25, min(4.0, ratio))
+    stages: list[float] = []
+    while ratio > 2.0:
+        stages.append(2.0)
+        ratio /= 2.0
+    while ratio < 0.5:
+        stages.append(0.5)
+        ratio /= 0.5
+    stages.append(ratio)
+    return ",".join(f"atempo={s:.6f}" for s in stages)
+
+
+def stretch_samples(samples: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+    """Pitch-preserving tempo change: ``ratio`` > 1 shortens by that factor.
+
+    Used as the fit stage's :data:`~ytdub.stages.fit.Stretcher`. The fitter forces the
+    result to its planned length afterwards, so atempo's few-ms inaccuracy is harmless.
+    """
+    from ytdub.audio import read_mono, write_wav
+
+    with tempfile.TemporaryDirectory(prefix="ytdub-stretch-") as d:
+        src, dst = Path(d) / "in.wav", Path(d) / "out.wav"
+        write_wav(src, samples, sr, subtype="FLOAT")
+        run([
+            "ffmpeg", "-y", "-nostdin", "-i", str(src), "-filter:a", atempo_chain(ratio),
+            "-ar", str(sr), "-c:a", "pcm_f32le", str(dst),
+        ])
+        out, _ = read_mono(dst)
     return out
 
 
-def faststart_remux(src: Path, dst: Path) -> Path:
-    """Copy streams into a share-ready MP4 (AAC audio + ``+faststart``), no re-encode of video."""
-    ensure_ffmpeg()
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    _run([
-        "ffmpeg", "-y", "-i", str(src),
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart", str(dst),
+@dataclass
+class Loudness:
+    integrated: float  # LUFS
+    true_peak: float  # dBTP
+    lra: float  # LU
+    threshold: float
+
+    def to_dict(self) -> dict:
+        return {"integrated_lufs": self.integrated, "true_peak_dbtp": self.true_peak,
+                "lra_lu": self.lra, "threshold": self.threshold}
+
+
+_LOUDNORM_JSON = re.compile(r"\{[^{}]*\"input_i\"[^{}]*\}", re.S)
+
+
+def measure_loudness(path: Path) -> Loudness:
+    """EBU R128 measurement via loudnorm's analysis pass."""
+    proc = run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-i", str(path), "-map", "0:a:0",
+        "-af", "loudnorm=print_format=json", "-f", "null", "-",
     ])
-    return dst
-
-
-def probe_duration(path: Path) -> float:
-    """Return media duration in seconds via ffprobe (0.0 if unknown)."""
-    exe = shutil.which("ffprobe")
-    if not exe:
-        raise RuntimeError("ffprobe not found (it ships with ffmpeg). Install ffmpeg.")
-    proc = subprocess.run(
-        [exe, "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
-        capture_output=True, text=True,
+    match = _LOUDNORM_JSON.search(proc.stderr)
+    if not match:
+        raise RuntimeError(f"could not parse loudnorm output for {path}")
+    data = json.loads(match.group(0))
+    return Loudness(
+        integrated=float(data["input_i"]), true_peak=float(data["input_tp"]),
+        lra=float(data["input_lra"]), threshold=float(data["input_thresh"]),
     )
-    try:
-        return float(proc.stdout.strip())
-    except ValueError:
-        return 0.0
 
 
-def extract_audio(src: Path, dst: Path, sample_rate: int = 16000) -> Path:
-    """Extract a mono WAV at ``sample_rate`` from any media file (for ASR/cloning)."""
-    ensure_ffmpeg()
+def normalize_to(src: Path, dst: Path, *, target: Loudness, measured: Loudness,
+                 sample_rate: int) -> Path:
+    """Two-pass loudnorm of ``src`` towards the *source's* loudness, not a fixed target.
+
+    ``linear=true`` applies a single gain where the true-peak ceiling allows it (no
+    dynamic compression). The caller re-enforces the sample count afterwards.
+    """
+    target_i = max(-70.0, min(-5.0, target.integrated))
+    target_tp = max(-9.0, min(-1.0, target.true_peak))
+    target_lra = max(1.0, min(50.0, target.lra))
+    af = (
+        f"loudnorm=I={target_i:.2f}:TP={target_tp:.2f}:LRA={target_lra:.2f}"
+        f":measured_I={measured.integrated:.2f}:measured_TP={measured.true_peak:.2f}"
+        f":measured_LRA={measured.lra:.2f}:measured_thresh={measured.threshold:.2f}"
+        ":linear=true:print_format=summary"
+    )
     dst.parent.mkdir(parents=True, exist_ok=True)
-    _run([
-        "ffmpeg", "-y", "-i", str(src),
-        "-vn", "-ar", str(sample_rate), "-ac", "1", str(dst),
+    run([
+        "ffmpeg", "-y", "-nostdin", "-i", str(src), "-af", af,
+        "-ar", str(sample_rate), "-ac", "1", "-c:a", "pcm_f32le", str(dst),
     ])
     return dst
 
 
-def _atempo_chain(factor: float) -> list[str]:
-    """ffmpeg's atempo filter only accepts 0.5–2.0; chain factors for larger changes.
+def mux_audio(video: Path, audio: Path, out: Path) -> Path:
+    """Preview MP4: original video stream copied, dubbed audio as AAC.
 
-    ``factor`` > 1 speeds up (shorter output); < 1 slows down (longer output).
-    Pitch is preserved, which is exactly what we want for dubbing.
+    Only ever called after probing confirmed a video stream exists.
     """
-    factor = max(0.25, min(4.0, factor))
-    stages: list[float] = []
-    remaining = factor
-    while remaining > 2.0:
-        stages.append(2.0)
-        remaining /= 2.0
-    while remaining < 0.5:
-        stages.append(0.5)
-        remaining /= 0.5
-    stages.append(remaining)
-    return ["atempo=" + ",atempo=".join(f"{s:.6f}" for s in stages)]
-
-
-def time_stretch(src: Path, dst: Path, factor: float) -> Path:
-    """Change tempo by ``factor`` (pitch-preserving) via ffmpeg atempo. factor 1.0 = copy."""
-    ensure_ffmpeg()
-    if abs(factor - 1.0) < 1e-3:
-        shutil.copyfile(src, dst)
-        return dst
-    _run([
-        "ffmpeg", "-y", "-i", str(src),
-        "-filter:a", *_atempo_chain(factor),
-        "-ar", "24000", str(dst),
-    ])
-    return dst
-
-
-def mux_audio(video: Path, audio: Path, out: Path, *, reencode_video: bool = False) -> Path:
-    """Replace the video's audio track with ``audio``, producing a share-ready MP4.
-
-    The output is tuned for messaging apps (WhatsApp/Telegram): AAC audio and
-    ``+faststart`` so the file starts playing before it is fully downloaded. By default
-    the video stream is copied (fast, lossless); set ``reencode_video`` to force a
-    broadly-compatible H.264 (yuv420p) re-encode when the source codec is exotic.
-    """
-    ensure_ffmpeg()
     out.parent.mkdir(parents=True, exist_ok=True)
-    video_args = (
-        ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "high", "-crf", "23"]
-        if reencode_video
-        else ["-c:v", "copy"]
-    )
-    _run([
-        "ffmpeg", "-y",
-        "-i", str(video),
-        "-i", str(audio),
-        "-map", "0:v:0", "-map", "1:a:0",
-        *video_args,
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        "-shortest", str(out),
+    tmp = out.with_name(out.stem + ".tmp" + out.suffix)
+    run([
+        "ffmpeg", "-y", "-nostdin", "-i", str(video), "-i", str(audio),
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+        "-movflags", "+faststart", str(tmp),
     ])
+    tmp.replace(out)
     return out
