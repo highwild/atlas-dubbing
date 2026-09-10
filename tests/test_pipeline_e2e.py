@@ -130,6 +130,30 @@ class FakeTTS:
         pass
 
 
+class CudaFailTTS(FakeTTS):
+    """Dies with the real CUDA fault partway through the first language.
+
+    A device-side assert poisons the CUDA context, so this is not one broken line: every
+    later call in the process fails the same way. The pipeline must stop rather than
+    report five more languages as broken when they were never really attempted.
+    """
+
+    name = "cuda-fail-tts"
+    die_after = 3
+    calls = 0
+
+    def synthesize(self, text, ref, language, out_path, seed):
+        CudaFailTTS.calls += 1
+        if CudaFailTTS.calls > self.die_after:
+            raise RuntimeError("CUDA error: device-side assert triggered")
+        return super().synthesize(text, ref, language, out_path, seed)
+
+    def unload(self):
+        # The teardown fails too, exactly as it did on the real box; the report still has
+        # to be written.
+        raise RuntimeError("CUDA error: device-side assert triggered")
+
+
 def fake_transcribe(audio_path, **kw):
     from ytdub.stages.transcribe import Transcript
 
@@ -671,3 +695,23 @@ def test_a_missing_voice_file_falls_back_to_the_automatic_reference(home):
     assert results["de"].status == "srt-only"
     assert "no audio file found" in (home / "output" / "talk" / "dub.log").read_text(
         encoding="utf-8")
+
+
+def test_a_dead_cuda_context_stops_the_job_and_still_writes_the_report(home):
+    """The failure that cost four languages and the report on the real run: the assert
+    poisons the context, so nothing after it can work. Stop, say so once, keep the cache."""
+    CudaFailTTS.calls = 0
+    results, _ = run(home, languages=["de", "pl"], tts_backend=f"{__name__}:CudaFailTTS")
+    assert results["de"].status == "failed"
+    assert "CUDA context" in results["de"].error or "device-side assert" in results["de"].error
+    assert results["pl"].status == "skipped", "the second language was never attempted"
+    assert "not attempted" in results["pl"].error
+    log = (home / "output" / "talk" / "dub.log").read_text(encoding="utf-8")
+    assert "CUDA context lost" in log
+    report = json.loads((home / "output" / "talk" / "report.json").read_text())
+    statuses = {entry["lang"]: entry["status"] for entry in report["languages"]}
+    assert statuses == {"de": "failed", "pl": "skipped"}
+    # The clips written before the fault stay on disk, so a rerun resumes instead of
+    # synthesizing the finished lines again.
+    clips = list((home / "work").glob("talk-*/clips/de/*.wav"))
+    assert len(clips) == CudaFailTTS.die_after, clips

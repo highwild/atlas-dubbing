@@ -665,7 +665,7 @@ class Job:
                 self.results[lang].status = "srt-only"
             return self._finish()
 
-        from ytdub.stages.tts.base import get_tts
+        from ytdub.stages.tts.base import CudaContextLost, get_tts
 
         tts = None
         try:
@@ -677,13 +677,39 @@ class Job:
                         tts = get_tts(self.s.tts_backend, self.s)
                     log.info(f"===== [{lang}] synthesis + fitting =====")
                     self._dub_language(lang, groups[lang], tts)
+                except CudaContextLost as exc:
+                    # The GPU is gone for the rest of the process, so every remaining
+                    # language would fail instantly and be reported as broken when it was
+                    # never really tried. Stop, say so once, and keep the cache: the clips
+                    # written before the fault are reused by the rerun.
+                    log.error(f"[{lang}] {exc}")
+                    self.results[lang].status = "failed"
+                    self.results[lang].error = str(exc)
+                    self.results[lang].warnings.append(
+                        "stopped at the CUDA fault; clips already synthesized are cached")
+                    remaining = [other for other in self.s.languages
+                                 if other not in groups or
+                                 self.results[other].status == "pending"]
+                    for other in remaining:
+                        self.results[other].status = "skipped"
+                        self.results[other].error = "not attempted: CUDA context lost"
+                    if remaining:
+                        log.error(f"CUDA context lost; {', '.join(remaining)} not attempted. "
+                                  "Rerun the same command: finished stages and clips come "
+                                  "from the cache, and only missing audio is synthesized.")
+                    break
                 except Exception as exc:
                     log.exception(f"[{lang}] dubbing failed")
                     self.results[lang].status = "failed"
                     self.results[lang].error = f"{type(exc).__name__}: {exc}"
         finally:
             if tts is not None:
-                tts.unload()
+                # Best-effort: a dead context raises from here, and the report below is
+                # worth more than a tidy teardown.
+                try:
+                    tts.unload()
+                except RuntimeError as exc:  # includes a poisoned CUDA context
+                    log.debug(f"unloading the TTS backend failed ({exc}); exiting anyway")
         return self._finish()
 
     def _finish(self) -> list[LanguageResult]:

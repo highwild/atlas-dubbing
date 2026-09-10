@@ -337,3 +337,46 @@ def test_cli_rejects_unknown_style_and_language(tmp_path, monkeypatch):
     monkeypatch.setenv("YTDUB_HOME", str(_home(tmp_path)))
     assert cli.main(["talk.wav", "--style", "nope"]) == 1
     assert cli.main(["talk.wav", "xx"]) == 1
+
+
+def test_free_memory_never_raises_even_with_a_dead_cuda_context(monkeypatch):
+    """It runs from the teardown path: raising here skips writing the report, which is how
+    a poisoned CUDA context cost the record of an otherwise finished job."""
+    import sys
+    import types
+
+    from ytdub import gpu
+
+    fake = types.ModuleType("torch")
+
+    class Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def empty_cache():
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+        @staticmethod
+        def memory_allocated():
+            return 0
+
+    fake.cuda = Cuda
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    gpu.free_memory()  # must not raise
+
+
+def test_sticky_cuda_faults_are_told_apart_from_recoverable_ones():
+    from ytdub.stages.tts.base import is_cuda_lost
+
+    assert is_cuda_lost(RuntimeError("CUDA error: device-side assert triggered"))
+    assert is_cuda_lost(RuntimeError("CUDA error: an illegal memory access was encountered"))
+    # Caused by a CUDA fault several frames down, as the real traceback was.
+    deep = RuntimeError("max(): Expected reduction dim 1 to have non-zero size")
+    deep.__cause__ = RuntimeError("CUDA error: device-side assert triggered")
+    assert is_cuda_lost(deep)
+    # Out of memory keeps the context alive, so the next line can still be synthesized.
+    assert not is_cuda_lost(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
+    assert not is_cuda_lost(RuntimeError("simulated TTS crash"))
+    assert not is_cuda_lost(ValueError("nope"))

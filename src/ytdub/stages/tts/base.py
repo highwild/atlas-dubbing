@@ -7,6 +7,7 @@ where it stopped and editing one line of a review SRT only resynthesizes that li
 
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
 from dataclasses import replace
@@ -23,6 +24,30 @@ log = stage_logger("tts")
 
 
 BUILTIN = {"chatterbox": "ytdub.stages.tts.chatterbox:ChatterboxBackend"}
+
+
+# A CUDA context poisoned by a device-side assert (or any other sticky CUDA fault) fails
+# every subsequent CUDA call in the process. It is not a per-line problem: the model can
+# never produce audio again, so continuing turns one bad line into every remaining line of
+# every remaining language, each logged as if it were independently broken. "CUDA out of
+# memory" is deliberately NOT matched — that one is recoverable and keeps the context.
+_CUDA_LOST = re.compile(r"CUDA error|device-side assert|illegal memory access",
+                        re.IGNORECASE)
+
+
+class CudaContextLost(RuntimeError):
+    """The GPU is unusable for the rest of this process. Aborts the job, keeps the cache."""
+
+
+def is_cuda_lost(exc: BaseException) -> bool:
+    """True if ``exc`` (or anything it was raised from) is a sticky CUDA fault."""
+    seen = 0
+    while exc is not None and seen < 10:
+        if _CUDA_LOST.search(str(exc)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
 
 
 class TTSBackend(Protocol):
@@ -221,7 +246,14 @@ def synthesize_all(
                 log.warning(f"[{language}] line {seg.index}: still {problem}; keeping it")
             tmp.replace(path)
             clips[seg.index] = path
-        except Exception:
+        except Exception as exc:
+            if is_cuda_lost(exc):
+                # Every later call fails too, so the loop is pointless: report the one
+                # real failure with its traceback and let the pipeline stop the job.
+                log.exception(f"[{language}] line {seg.index}: the CUDA context is dead; "
+                              "giving up on this language (clips already written stay cached)")
+                raise CudaContextLost(
+                    f"[{language}] line {seg.index}: {type(exc).__name__}: {exc}") from exc
             log.exception(f"[{language}] TTS failed for line {seg.index} ({text[:60]!r})")
             failed.append(seg.index)
         elapsed = time.monotonic() - started
