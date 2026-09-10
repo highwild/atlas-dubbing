@@ -105,25 +105,19 @@ def _pick_input(settings: Settings) -> str | None:
     """What ``dub2`` with no file should dub: the newest file in ``input/``.
 
     "The file I just dropped in" is the only reading of a bare command that is never a
-    guess in practice, so newest wins over alphabetical order. With more than one
-    candidate at a terminal it asks first — a wrong pick is not a wrong answer, it is an
-    hour of GPU on the wrong video — and it announces the choice either way, so the file
-    being dubbed is the first thing in the log rather than something noticed later.
+    guess in practice, so newest wins over alphabetical order.
+
+    It does not ask for confirmation. It used to, and that was wrong: a one-word command
+    that immediately wants a second word is not a one-word command, and the answer to the
+    question is Enter every time. The pick is announced instead, as the first line of the
+    run, so a wrong file is visible in the first second and Ctrl-C costs nothing — much
+    less than a prompt on every run costs when the pick is right.
     """
     candidates = _input_candidates(settings)
     if not candidates:
         return None
     picked = candidates[0]
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(picked.stat().st_mtime))
-    if len(candidates) > 1 and sys.stdin.isatty():
-        others = ", ".join(f.name for f in candidates[1:4])
-        more = f" (+{len(candidates) - 4} more)" if len(candidates) > 4 else ""
-        answer = input(f"{len(candidates)} files in {settings.input_dir}; newest is "
-                       f"{picked.name}. Others: {others}{more}.\n"
-                       f"Dub {picked.name}? [Y/n] ").strip().lower()
-        if answer not in ("", "y", "yes"):
-            print("Nothing run. Name the file: dub2 <file> [langs]")
-            return ""
     print(f"No file named; dubbing the newest in {settings.input_dir}: "
           f"{picked.name} ({when})", flush=True)
     return picked.name
@@ -198,11 +192,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.input:
         picked = _pick_input(settings)
-        if not picked:
+        if picked is None:
             _usage(parser, settings)
-            if picked is None:
-                print(f"\nNothing to dub: {settings.input_dir} is empty. Drop a file in "
-                      "there and run dub2 again, or name one.")
+            print(f"\nNothing to dub: {settings.input_dir} is empty. Drop a file in "
+                  "there and run dub2 again, or name one.")
             return 1
         args.input = picked
     styles = available_styles(settings.styles_dir)

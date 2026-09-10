@@ -62,9 +62,10 @@ That is the whole flow: copy a file into `input/`, type `dub2`, walk away. Nothi
 needed — voices are counted, references are cut, your clip in `.env` is matched by voice,
 every language is translated and dubbed.
 
-With more than one file in `input/` it says which one it is about to use and asks first
-(only at a terminal). Declining, or an empty `input/`, prints usage and runs nothing. To
-skip the question, name the file: `dub2 hydro.wav`.
+It says which file it is about to use, and starts work immediately — no confirmation,
+because a one-word command that immediately wants a second word is not a one-word command.
+To dub something else, name it: `dub2 hydro.wav`. An empty `input/` prints usage and runs
+nothing.
 
 Which file counts as newest is by modification time, so a file you just copied over is the
 one it picks. The choice is the first line of the log.

@@ -291,19 +291,27 @@ def test_bare_cli_says_nothing_to_do_when_input_is_empty(tmp_path, monkeypatch, 
     assert "Nothing to dub" in capsys.readouterr().out
 
 
-def test_bare_cli_asks_before_picking_when_several_files_are_there(tmp_path, monkeypatch, capsys):
+def test_bare_cli_does_not_ask_when_several_files_are_there(tmp_path, monkeypatch, capsys):
+    """The one-word command must not want a second word: it announces the pick instead."""
+    import os
+    import time
+
     from ytdub import cli, pipeline
 
     home = _home(tmp_path)
     monkeypatch.setenv("YTDUB_HOME", str(home))
-    for name in ("a.wav", "b.wav"):
+    for name, age in (("a.wav", 3600), ("b.wav", 60)):
         (home / "input" / name).write_bytes(b"x")
+        os.utime(home / "input" / name, (time.time() - age, time.time() - age))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    monkeypatch.setattr("builtins.input",
+                        lambda prompt="": pytest.fail(f"must not prompt ({prompt})"))
+    captured = {}
     monkeypatch.setattr(pipeline, "run_job",
-                        lambda *a, **k: pytest.fail("declining the pick must not run a job"))
-    assert cli.main([]) == 1
-    assert "Name the file" in capsys.readouterr().out
+                        lambda settings, arg, **k: captured.update(input=arg) or [])
+    assert cli.main([]) == 0
+    assert captured["input"] == "b.wav"
+    assert "dubbing the newest" in capsys.readouterr().out
 
 
 def test_cli_flags_in_any_order(tmp_path, monkeypatch):
