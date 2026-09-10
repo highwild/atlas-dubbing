@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     diarize_method: str = "pyannote"  # "pyannote" | "embedding" (token-free)
     hf_token: str | None = None
 
+    # --- Sentences ----------------------------------------------------------
+    # Whisper's lines are cut on pauses as well as on punctuation, which leaves
+    # half-sentences that the translator, the synthesizer and the fitter all handle badly
+    # (see stages/sentences.py). They are joined into whole sentences once, after
+    # diarization and before anything else reads them. `--no-join-fragments` turns it off.
+    join_fragments: bool = True
+    join_max_gap: float = 2.0      # do not bridge a longer silence
+    join_max_seconds: float = 20.0  # nor build a line longer than this
+    join_max_chars: int = 300
+    join_min_chars: int = 12       # a line this short joins its neighbour regardless
+
     # --- Voice references ---------------------------------------------------
     ref_target_seconds: float = 10.0  # Chatterbox conditions on ~10 s
     ref_min_seconds: float = 4.0

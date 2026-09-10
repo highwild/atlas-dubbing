@@ -286,20 +286,20 @@ def test_audio_only_job(home):
         assert abs(info.frames / info.samplerate - DURATION) < 0.001
         # No content lost; short fragments merged where a same-speaker neighbour exists.
         assert r.lost_segments == []
-        # Three: "So." and "Oh" merge with their neighbours, and "Hm" — a one-word line
-        # with no same-speaker neighbour near it — is spoken with the nearest line of that
-        # speaker rather than handed to the synthesizer alone.
-        assert r.merged_fragments == 3
+        # Sentences first: the 9 transcribed lines join into 6 (see stages/sentences.py),
+        # and then "Hm" — a one-word line with no same-speaker neighbour near it — is spoken
+        # with the nearest line of that speaker rather than handed to the synthesizer alone.
+        assert r.merged_fragments == 1
         # Audio in -> audio + SRT out, no mux attempted.
         assert not (out / f"{lang}.mp4").exists()
         cues = srt_cues(out / f"{lang}.srt")
-        # One cue per synthesized line: 9 source lines, three fragments folded in.
-        assert len(cues) == len(SCRIPT) - 3
+        # One cue per synthesized line: 9 transcribed lines, joined into 6, then 5.
+        assert len(cues) == len(SCRIPT) - 4
         for a, b in zip(cues, cues[1:]):
             assert a.end <= b.start + 0.001
         assert all(c.end <= DURATION + 0.001 for c in cues)
         assert (out / f"{lang}.review.srt").exists()
-        assert r.fit["segments"] == len(SCRIPT) - 3
+        assert r.fit["segments"] == len(SCRIPT) - 4
         assert r.fit["worst_ratio"] <= 1.2
         # Loudness matched to the source, not a fixed target.
         src_lufs = r.loudness["source"]["integrated_lufs"]
@@ -553,7 +553,9 @@ def test_one_tts_failure_is_reported_not_fatal(home):
     FakeTTS.fail_on = {translate_text(SCRIPT[6][3], "de")}
     results, _ = run(home, languages=["de"])
     r = results["de"]
-    assert r.status == "degraded" and r.lost_segments == [6]
+    # The line number is the joined one: that is the numbering the review file uses, and
+    # the one a person reading the log can act on.
+    assert r.status == "degraded" and r.lost_segments == [3]
     info = sf.info(home / "output" / "talk" / "de.wav")
     assert info.frames == round(DURATION * 48000)  # still exact
 
@@ -639,8 +641,8 @@ def test_digits_are_spoken_but_the_srt_keeps_them(home, monkeypatch):
     from ytdub.stages import transcribe
 
     monkeypatch.setattr(transcribe, "transcribe",
-                        _numbered_script("give that a 4.5 overall",
-                                         "out of 10 brown leaves"))
+                        _numbered_script("give that a 4.5 overall.",
+                                         "Out of 10 brown leaves."))
     results, _ = run(home, languages=["pl"])
     assert results["pl"].status == "ok"
 
@@ -676,7 +678,7 @@ def test_toggling_number_expansion_resynthesizes_only_the_lines_it_changes(home,
     from ytdub.stages import transcribe
 
     monkeypatch.setattr(transcribe, "transcribe",
-                        _numbered_script("give that a 4.5 overall", "no numbers here"))
+                        _numbered_script("give that a 4.5 overall.", "No numbers here."))
     run(home, languages=["pl"])
     assert CALLS["tts"] == 2
     before = CALLS["tts"]
@@ -773,7 +775,7 @@ def test_a_looping_clip_is_dropped_not_kept(home):
     results, _ = run(home, languages=["de"], tts_backend=f"{__name__}:LoopingTTS")
     r = results["de"]
     assert r.status == "degraded"
-    assert r.lost_segments == [6], r.lost_segments
+    assert r.lost_segments == [3], r.lost_segments  # joined numbering, as in the review SRT
     log = (home / "output" / "talk" / "dub.log").read_text(encoding="utf-8")
     assert "dropping the clip" in log
     # Nothing 25 seconds long is left on disk to be reused as if it were speech.

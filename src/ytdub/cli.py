@@ -44,6 +44,10 @@ def _parser() -> argparse.ArgumentParser:
                           "speaker sounds like it, so the per-file SPK label never has to "
                           "be named. Also YTDUB_VOICE")
     review = p.add_argument_group("review loop")
+    job.add_argument("--no-join-fragments", dest="join_fragments", action="store_false",
+                     default=None,
+                     help="keep Whisper's lines as they are instead of joining the "
+                          "half-sentences back into whole ones")
     review.add_argument("--srt-only", action="store_true",
                         help="stop after translation; write <lang>.review.srt for checking")
     review.add_argument("--from-review", action="store_true",
@@ -176,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         "device": args.device, "cookies_from_browser": args.cookies_from_browser,
         "tts_backend": args.tts_backend, "translator": args.translator,
         "verify_ollama_model": args.verify_ollama_model, "voice": args.voice,
-        "speaker_map": args.speaker_map or None,
+        "speaker_map": args.speaker_map or None, "join_fragments": args.join_fragments,
     }.items() if v is not None}
     if args.langs:
         overrides["languages"] = [lang.lower() for lang in args.langs]

@@ -209,6 +209,23 @@ class Job:
                     "diarizer, which separates similar voices poorly.")
         return "embedding"
 
+    def _join_inputs(self) -> dict:
+        """The sentence-joining settings, for the diarize key: they change its output."""
+        return {"join": self.s.join_fragments, "gap": self.s.join_max_gap,
+                "seconds": self.s.join_max_seconds, "chars": self.s.join_max_chars,
+                "min_chars": self.s.join_min_chars}
+
+    def _joined(self, segments: list[Segment]) -> list[Segment]:
+        """Whole sentences instead of Whisper's half-lines (see stages/sentences.py)."""
+        if not self.s.join_fragments:
+            return segments
+        from ytdub.stages.sentences import join_fragments
+
+        return join_fragments(segments, max_gap=self.s.join_max_gap,
+                              max_seconds=self.s.join_max_seconds,
+                              max_chars=self.s.join_max_chars,
+                              min_chars=self.s.join_min_chars)
+
     def _diarize(self) -> None:
         segs = self.transcript.segments
         # Skipped entirely for one speaker rather than run with num_speakers=1: the answer
@@ -216,10 +233,11 @@ class Job:
         # and a count of one that comes back as two is a bug this never has to guard.
         method = self._diarize_method() if self.s.multi_voice else "none"
         inputs = {"transcript": self.transcript_key, "speakers": self.s.speakers,
-                  "method": method, "speaker_map": self.s.speaker_map.strip()}
+                  "method": method, "speaker_map": self.s.speaker_map.strip(),
+                  **self._join_inputs()}
         self.diarize_key = StageCache.key(inputs)
         if not self.s.multi_voice:
-            self.segments = [s for s in segs]
+            self.segments = self._joined([s for s in segs])
             return
         cached = self.cache.load("diarize", inputs)
         if cached is not None:
@@ -236,9 +254,9 @@ class Job:
             self.segments = diarize.diarize_embedding(self.asr_wav, segs,
                                                       num_speakers=self.s.speakers,
                                                       device=self.s.device)
-        # A tiny island of lines between one dominant speaker is a split, and it is worth
-        # removing before anything downstream sees it. In the key, because it changes the
-        # labels the key is supposed to stand for.
+        # Sentences first, then the manual correction: --speaker-map names lines by their
+        # number in the review SRT, and the review SRT is written from the joined lines.
+        self.segments = self._joined(self.segments)
         if self.s.speaker_map.strip():
             # Applied *before* the result is cached and before the key is used by anything
             # downstream: an out-of-band override that the key does not see would let a
@@ -561,7 +579,12 @@ class Job:
                 out[lang] = [(cues[i].text.strip(), lines) for i, lines in groups]
                 log.info(f"[{lang}] using reviewed text from {path.name}")
             except Exception as exc:
-                log.exception(f"[{lang}] cannot use review SRT")
+                hint = ""
+                if self.s.join_fragments and "more cues than transcript lines" in str(exc):
+                    hint = (f" — this file was written before sentences were joined, so its "
+                            f"line numbers no longer match: {len(self.segments)} sentences "
+                            "now. Run with --srt-only to write a fresh one.")
+                log.exception(f"[{lang}] cannot use review SRT{hint}")
                 self.results[lang].status, self.results[lang].error = "failed", f"review: {exc}"
         return out
 

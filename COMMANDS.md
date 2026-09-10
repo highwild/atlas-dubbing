@@ -99,6 +99,7 @@ the job starts, naming what is supported — no hours wasted before finding out.
 |---|---|---|
 | `--style NAME` | `casual` | a preset from `synopses/`. Currently `casual`, `duo`, `professional`. Drop a new `.txt` in and it appears here. |
 | `--speakers N` | `0` | `0` = count the voices with the diarizer (default), `1` = one speaker, `N` = force N. Multi-voice mode tags every line with its `SPK` label and gives each speaker their own cloned voice. |
+| `--no-join-fragments` | joined | Whisper splits on pauses as well as on punctuation, which leaves half-sentences; they are joined back into whole ones after diarization and before translation. This keeps the split lines instead. |
 | `--source LANG` | auto | source language; skip Whisper's detection when you know it |
 | `--ref [SPK=]PATH` | auto | voice reference clip, repeatable: `--ref atlas.wav` or `--ref SPK1=guest.wav`. Without it, a reference is cut from the input itself. |
 | `--voice PATH` | `YTDUB_VOICE` | **your own voice clip** (file or a folder of clips), matched to whichever speaker sounds like it — so the per-file `SPK` label never has to be named. A second label that also matches you is folded into the first. Also `YTDUB_VOICE`. |
@@ -370,6 +371,27 @@ named in `.env` is matched to whichever speaker sounds like you.
 
 `.env` is read from the project root whatever directory the command is typed from, so
 `YTDUB_VOICE` and `YTDUB_HF_TOKEN` apply everywhere, not only from the repo root.
+
+## Sentences, not lines
+
+Whisper's segmenter flushes on a pause longer than 0.6 s as well as on sentence punctuation,
+because diarization needs short spans to label. The cost is half-sentences: on `hydro.wav`
+**30 of 51 lines did not end a sentence** (`...for engineering and a` / `test track.`).
+
+Everything downstream was paying for that separately — the translator echoed the
+meaningless fragments back in the source language, the synthesizer crashed or produced
+breath noise on one-word lines, the fitter compressed lines that were too long for a slot
+that was only half theirs. So they are joined once, straight after diarization, where each
+line's speaker is known: **51 lines became 29 sentences, fragments 30 → 11** (the 11 left
+are turns that end mid-sentence because the next speaker cuts in, and those must not be
+joined across voices).
+
+Tuning, in `.env`: `YTDUB_JOIN_MAX_GAP` (2.0 s), `YTDUB_JOIN_MAX_SECONDS` (20),
+`YTDUB_JOIN_MAX_CHARS` (300), `YTDUB_JOIN_MIN_CHARS` (12). `YTDUB_JOIN_FRAGMENTS=0` or
+`--no-join-fragments` turns it off.
+
+Because the join happens before the review file is written, **line numbers in the review
+SRT are the joined ones** — and so is the numbering `--speaker-map` expects.
 
 ## Diarization
 
