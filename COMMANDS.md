@@ -132,6 +132,7 @@ the job starts, naming what is supported — no hours wasted before finding out.
 | `--max-delay S` | `2.0` | soft cap on how late a line may start |
 | `--cps N` | `15.0` | speaking rate used for translation character budgets |
 | `--min-confidence P` | `0.45` | drop transcribed segments below this mean word probability as probable noise |
+| `YTDUB_MIN_TTS_CHARS` | `3` | a line shorter than this, **or a single word**, is merged into a same-speaker neighbour before synthesis. One-word lines are what crash Chatterbox: `Would`, `Tanguy`, `Jak?`, `No!`. Merging happens for the audio only — the SRT and review file keep the line as written. |
 | `--loudness-ref PATH` | input file | match loudness to this instead: `--loudness-ref mix.wav` when dubbing a clean stem |
 | `--no-loudness` | — | skip loudness matching |
 | `--no-mux` | — | never write the preview `<lang>.mp4` |

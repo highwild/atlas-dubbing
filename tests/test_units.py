@@ -81,6 +81,43 @@ def test_fragment_never_merges_across_speakers_or_big_gaps():
     assert len(merged) == 4 and sorted(stuck) == [1, 3]
 
 
+def test_a_single_word_is_a_fragment_however_many_letters_it_has():
+    """The ones that crashed the synthesizer were not the shortest — "Would", "Tanguy",
+    "Jak?" are four to six characters and one word each."""
+    from ytdub.stages.tts.base import is_fragment
+
+    assert is_fragment(seg(0, 0, 1, translated="Would"), 3)
+    assert is_fragment(seg(0, 0, 1, translated="Tanguy"), 3)
+    assert is_fragment(seg(0, 0, 1, translated="Jak?"), 3)
+    assert is_fragment(seg(0, 0, 1, translated="No!"), 3)
+    assert is_fragment(seg(0, 0, 1, translated="to"), 3)
+    assert not is_fragment(seg(0, 0, 1, translated="Dziękuję bardzo"), 3)
+    assert not is_fragment(seg(0, 0, 1, translated="ok, ja"), 3)
+
+
+def test_a_one_word_line_merges_into_its_neighbour_instead_of_crashing():
+    from ytdub.stages.tts.base import merge_short_fragments
+
+    segs = [seg(0, 0, 2, translated="Odbudowana lokomotywa", speaker="SPK0"),
+            seg(1, 2.1, 2.6, translated="Jak?", speaker="SPK0"),
+            seg(2, 2.8, 5, translated="To działa tak", speaker="SPK0")]
+    merged, stuck = merge_short_fragments(segs, min_chars=3)
+    assert [m.speech_text for m in merged] == ["Odbudowana lokomotywa Jak?", "To działa tak"]
+    assert stuck == []
+
+
+def test_a_one_word_line_still_never_crosses_speakers():
+    """Merging it anywhere would be better than crashing, except onto another voice: that
+    would put your word in their mouth."""
+    from ytdub.stages.tts.base import merge_short_fragments
+
+    segs = [seg(0, 0, 2, translated="Pierwsza osoba", speaker="SPK0"),
+            seg(1, 2.1, 2.6, translated="Tanguy", speaker="SPK1"),
+            seg(2, 2.8, 5, translated="Znowu pierwsza", speaker="SPK0")]
+    merged, stuck = merge_short_fragments(segs, min_chars=3)
+    assert len(merged) == 3 and stuck == [1]
+
+
 def test_fragment_merges_forward_when_it_opens_a_turn():
     from ytdub.stages.tts.base import merge_short_fragments
 

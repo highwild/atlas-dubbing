@@ -86,19 +86,34 @@ def spoken_chars(text: str) -> int:
     return sum(1 for c in text if unicodedata.category(c)[0] in "LNM")
 
 
+def is_fragment(seg: Segment, min_chars: int) -> bool:
+    """True if this line is too short to hand to the synthesizer on its own.
+
+    Two ways to qualify: fewer than ``min_chars`` spoken characters, or a single word.
+    The second is the one that matters. Chatterbox's alignment analyzer has two ways to
+    die on a one-word line — a host-side ``IndexError: max(): Expected reduction dim 1 to
+    have non-zero size`` in its pooling, and a device-side assert inside a CUDA kernel,
+    which poisons the context for the whole process and costs every line after it.
+    ``Jak?``, ``Would``, ``Tanguy``, ``Okay.``, ``No!`` are all one word; a character
+    threshold of three only ever caught the shortest of them.
+    """
+    text = seg.speech_text.strip()
+    return spoken_chars(text) < min_chars or len(text.split()) <= 1
+
+
 def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
                           max_gap: float = 1.5) -> tuple[list[Segment], list[int]]:
-    """Merge lines with fewer than ``min_chars`` spoken characters into a neighbour.
+    """Merge fragment lines into a neighbour; see :func:`is_fragment` for what counts.
 
-    Chatterbox's alignment analyzer takes a max over an empty slice on very short text
-    (``IndexError: max(): Expected reduction dim 1 to have non-zero size``); padding
-    with punctuation does not help. Merging preserves the words, adds no stutter and
-    also frees a little timeline.
+    Merging preserves the words, adds no stutter and also frees a little timeline, which
+    is strictly better than the alternatives: a crash, or a line padded with punctuation
+    that does not help.
 
     Only an *adjacent* segment of the *same* speaker within ``max_gap`` seconds is a
-    valid target (preferring the previous one), so speech order is never changed.
-    Returns ``(segments, unmergeable_indices)``; unmergeable fragments are kept and
-    synthesized alone, and reported if that fails.
+    valid target (preferring the previous one), so speech order is never changed. A
+    fragment with no such neighbour is left alone and reported — merging it across a
+    speaker, or across a long silence, would move the words somewhere they were not said.
+    Returns ``(segments, unmergeable_indices)``.
     """
     segs = [replace(s, sources=s.sources or [s.index]) for s in segments]
 
@@ -118,7 +133,7 @@ def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
     while changed:
         changed = False
         for i, seg in enumerate(segs):
-            if spoken_chars(seg.speech_text) >= min_chars or seg.sources[0] in stuck:
+            if not is_fragment(seg, min_chars) or seg.sources[0] in stuck:
                 continue
             if i > 0 and joinable(segs[i - 1], seg):
                 segs[i - 1:i + 1] = [merged(segs[i - 1], seg)]

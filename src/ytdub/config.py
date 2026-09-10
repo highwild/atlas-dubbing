@@ -157,6 +157,9 @@ class Settings(BaseSettings):
     tts_seed: int = 1234
     # Chatterbox crashes on utterances this short (IndexError in its alignment
     # analyzer); such lines are merged into an adjacent same-speaker line first.
+    # A line is a fragment — and gets merged into a same-speaker neighbour — when it is
+    # shorter than this in spoken characters, or when it is a single word (see
+    # stages/tts/base.py: one-word lines are what crash the synthesizer).
     min_tts_chars: int = 3
     merge_max_gap: float = 1.5  # only merge into a neighbour this close in time
     # Write digits out as words for the synthesizer only ("7,8" -> "siedem przecinek
