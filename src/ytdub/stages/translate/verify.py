@@ -226,6 +226,16 @@ def backtranslation_passed_through(target_text: str, back: str) -> bool:
     return bool(target) and target == back
 
 
+def translation_passed_through(source_text: str, translated: str) -> bool:
+    """True when the "translation" is the source written back out.
+
+    Same test as the back-translation one, used on the forward direction: an output
+    identical to its input is never a translation, and for a fragment it is the failure
+    mode seen in practice ("would" -> "Would", "okay i" -> "okay i").
+    """
+    return backtranslation_passed_through(source_text, translated)
+
+
 def _normalise(text: str) -> str:
     return " ".join(re.findall(r"\w+", text.casefold()))
 

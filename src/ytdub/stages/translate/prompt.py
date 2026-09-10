@@ -182,6 +182,44 @@ def single_line_prompt(line: Line, context: list[tuple[Line, str]], target_lang:
     return batch_prompt([line], context, [], target_lang)
 
 
+def fragment_retry_prompt(line: Line, prev_text: str | None, next_text: str | None,
+                          source_lang: str, target_lang: str) -> str:
+    """Ask again for a line that came back as the source written out.
+
+    The lines this exists for are transcribe fragments — the words of one sentence split
+    across two or three segments by a pause. A fragment on its own has no meaning to
+    translate, and the model's safe answer is to hand the word back unchanged ("would",
+    "okay i"), which is what ended up spoken inside the French and Spanish tracks. Naming
+    the situation is the whole point of the prompt: the neighbouring lines are shown so the
+    sentence is visible, and the reply is still just this line's part of it.
+    """
+    tgt, src = lang_name(target_lang), lang_name(source_lang)
+    parts = [
+        (f"Line {line.n} is a fragment: the {src} sentence it belongs to was split across "
+         "several lines when the video was transcribed, so on its own it is not a sentence "
+         "and its words do not stand alone."),
+        ("The neighbouring lines are shown for context only. Return the part of the sentence "
+         f"that line {line.n} carries, translated into {tgt}, in the same position: it must "
+         "read correctly when spoken straight after the line before it and straight before "
+         "the line after it."),
+        ("Do not return the source text unchanged. Do not translate the neighbouring lines "
+         "and do not repeat their words here."),
+        "",
+    ]
+    if prev_text:
+        parts.append(f"line before ({src}, already translated): {prev_text.strip()}")
+    parts.append(f"line {line.n} to translate now ({src}): {line.text.strip()}")
+    if next_text:
+        parts.append(f"line after ({src}, not your job): {next_text.strip()}")
+    parts += ["",
+              (f"Budget for line {line.n}: at most {line.budget} characters, and it should "
+               "stay as short as the source fragment it stands for."),
+              "",
+              'Reply with JSON only: {"lines":[{"n":' + str(line.n)
+              + ',"text":"..."}]}']
+    return "\n".join(parts)
+
+
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {

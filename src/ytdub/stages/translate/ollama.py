@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +53,7 @@ from ytdub.stages.translate.prompt import (
     TruncatedAnswer,
     batch_prompt,
     estimate_tokens,
+    fragment_retry_prompt,
     glossary_misses,
     lower_bound_tokens,
     needs_repair,
@@ -66,6 +68,9 @@ from ytdub.stages.translate.prompt import (
 )
 
 log = stage_logger("translate")
+
+# A source line ending like this closes a sentence, so the next line is not a continuation.
+_SENTENCE_END = re.compile(r"[.!?…:;]\s*[\"')\]]*$")
 
 # Chat-template tokens Ollama wraps around the messages.
 _TEMPLATE_OVERHEAD = 32
@@ -250,6 +255,10 @@ class TranslationStats:
     single_line_fallbacks: int = 0
     untranslated: list[int] = field(default_factory=list)
     answer_escalations: int = 0  # batches cut off at num_predict and retried with more room
+    # Lines that came back in the source language because they are sentence fragments.
+    echo_lines: int = 0
+    echo_retries: int = 0
+    echoes_fixed: int = 0
     over_budget_initial: int = 0
     over_budget_final: int = 0
     repair_requests: int = 0
@@ -280,6 +289,7 @@ class BatchTranslator:
                  verify_client: OllamaClient | None = None,
                  verify_retry_temperature: float = 0.8,
                  verify_echo_retries: int = 1,
+                 echo_retries: int = 1,
                  verify_report_path=None) -> None:
         self.client = client
         self.src = source_lang
@@ -299,6 +309,7 @@ class BatchTranslator:
         self.verify_client = verify_client
         self.verify_retry_temperature = verify_retry_temperature
         self.verify_echo_retries = verify_echo_retries
+        self.echo_retries = echo_retries
         self.verify_report_path = verify_report_path
         self.stats = TranslationStats(verified=verify)
 
@@ -355,6 +366,7 @@ class BatchTranslator:
             self._translate_batch(lines, pos, size, done)
             log.info(f"[{self.tgt}] translated {min(pos + size, len(lines))}/{len(lines)} lines")
             pos += size
+        self._retry_source_echoes(lines, done)
         if self.verify:
             self._verify_translations(lines, done)
         self._repair_budgets(lines, done)
@@ -421,6 +433,69 @@ class BatchTranslator:
                   f"{line.text!r}")
         self.stats.untranslated.append(line.n)
         done[line.n] = line.text
+
+    def _retry_source_echoes(self, lines: list[Line], done: dict[int, str]) -> None:
+        """One second attempt for lines that came back in the source language.
+
+        Only for lines that are a *continuation*: a word or phrase the transcription split
+        off mid-sentence. Such a line has no meaning alone, so handing it back unchanged is
+        the model's safe answer, and it is spoken as-is in the dub — "Would J'aimerais
+        acheter..." in the French track. A line that stands on its own and comes back
+        identical is left alone: "Tanguy", "Toyota", "Morrisons" are correct unchanged.
+
+        The retry is accepted only if it differs from the source and is not wildly longer
+        than the fragment's own budget, because the answer for a fragment that has been
+        given the whole sentence is sometimes the whole sentence.
+        """
+        if self.echo_retries < 1:
+            return
+        candidates = [i for i, line in enumerate(lines)
+                      if self._is_continuation(lines, i)
+                      and verify_mod.translation_passed_through(line.text, done.get(line.n, ""))]
+        if not candidates:
+            return
+        log.info(f"[{self.tgt}] {len(candidates)} line(s) came back untranslated "
+                 f"(fragments of a split sentence); asking again: "
+                 f"{[lines[i].n for i in candidates][:8]}")
+        self.stats.echo_lines += len(candidates)
+        for i in candidates:
+            line = lines[i]
+            user = fragment_retry_prompt(
+                line,
+                lines[i - 1].text if i else None,
+                lines[i + 1].text if i + 1 < len(lines) else None,
+                self.src, self.tgt)
+            self.stats.echo_retries += 1
+            try:
+                result = self.client.chat(
+                    self.system, user,
+                    num_predict=self._answer_budget(user, [line], factor=2.0),
+                    schema=RESPONSE_SCHEMA, label=f"[{self.tgt} fragment {line.n}]")
+                answer = parse_lines(result.content, [line.n])
+            except ParseError as exc:
+                log.debug(f"[{self.tgt}] fragment {line.n} retry unusable ({exc})")
+                continue
+            got = answer.get(line.n, "").strip()
+            if not got or verify_mod.translation_passed_through(line.text, got):
+                log.debug(f"[{self.tgt}] fragment {line.n} came back unchanged again")
+                continue
+            if len(got) > max(line.budget, len(line.text) * 3) * 2:
+                log.debug(f"[{self.tgt}] fragment {line.n} retry returned the whole sentence "
+                          f"({len(got)} chars); keeping the original")
+                continue
+            done[line.n] = got
+            self.stats.echoes_fixed += 1
+            log.success(f"[{self.tgt}] line {line.n} was untranslated ({line.text.strip()!r}) "
+                        f"-> {got!r}")
+
+    @staticmethod
+    def _is_continuation(lines: list[Line], i: int) -> bool:
+        """True if line ``i`` is the middle of a sentence rather than a sentence itself."""
+        prev = lines[i - 1].text.strip() if i else ""
+        nxt = lines[i + 1].text.strip() if i + 1 < len(lines) else ""
+        if prev and not _SENTENCE_END.search(prev):
+            return True
+        return bool(nxt) and nxt[0].islower()
 
     def _repair_budgets(self, lines: list[Line], done: dict[int, str]) -> None:
         by_n = {ln.n: ln for ln in lines}
@@ -883,6 +958,7 @@ class OllamaTranslator:
             "verify": s.verify, "verify_batch_lines": s.verify_batch_lines,
             "verify_model": self.verify_model,
             "verify_echo_retries": s.verify_echo_retries,
+            "translation_echo_retries": s.translation_echo_retries,
             "prompt_version": PROMPT_VERSION, "code": _code_hash(),
         }
 
@@ -920,6 +996,7 @@ class OllamaTranslator:
             verify_client=verify_client,
             verify_retry_temperature=self.s.verify_temperature,
             verify_echo_retries=self.s.verify_echo_retries,
+            echo_retries=self.s.translation_echo_retries,
             verify_report_path=(self.s.verify_report_path if self.s.verify else None),
         )
         texts = bt.translate(lines)

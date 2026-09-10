@@ -109,6 +109,8 @@ the job starts, naming what is supported — no hours wasted before finding out.
 |---|---|
 | `--srt-only` | stop after translation. Writes `<lang>.review.srt`, skips synthesis. Seconds to a couple of minutes instead of half an hour. |
 | `--from-review` | dub from the (edited) `<lang>.review.srt` files, skipping transcription and translation. Mutually exclusive with `--srt-only`. |
+| `YTDUB_TRANSLATION_ECHO_RETRIES` | `1` | a line that comes back in the source language is asked again, told it is a fragment of a sentence split across lines. Only applies to continuations — "Tanguy" or "Toyota" unchanged is correct and left alone. Measured: `would` -> `voudrais`, `okay i` -> `ok`. 0 disables. |
+
 | `--verify` | back-translation verification. ~3× the translation time. Writes `<lang>.verify.txt`. Also `YTDUB_VERIFY=1`. |
 | `--verify-model MODEL` | model for the verification pass only; translation stays on `--ollama-model`. `qwen27-24k:latest` is the one worth using — it flagged 3 lines where 8b flagged 7, and its flags were the accurate ones. |
 

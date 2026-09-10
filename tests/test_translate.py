@@ -252,6 +252,66 @@ def test_a_cut_off_answer_is_given_more_room_before_the_batch_is_split():
     assert t.stats.untranslated == []
 
 
+FRAG_N = re.compile(r"line (\d+) to translate now")
+
+
+def test_a_fragment_that_came_back_untranslated_is_asked_again():
+    """The real failure: Whisper split "okay I would like to purchase" into three lines, and
+    the French track got "Okay i" and "Would" spoken in it. Framed as a fragment, the model
+    answers "ok" and "voudrais" (measured against the live model on those two lines)."""
+    def responder(user):
+        if "is a fragment" in user:
+            return answer({int(FRAG_N.search(user)[1]): "voudrais"})
+        return answer({n: ("would" if n == 2 else f"T{n}") for n in asked(user)})
+
+    lines = [Line(1, "okay i", 20), Line(2, "would", 20), Line(3, "like to purchase", 20)]
+    t = translator(FakeClient(responder), batch_lines=3)
+    out = t.translate(lines)
+    assert out == ["T1", "voudrais", "T3"]
+    assert t.stats.echo_lines == 1 and t.stats.echoes_fixed == 1
+
+
+def test_a_line_that_stands_alone_is_not_retried_when_unchanged():
+    """"Tanguy" coming back as "Tanguy" is a correct translation of a name. Only a line in
+    the middle of a sentence is evidence that the model handed the source back."""
+    def responder(user):
+        assert "is a fragment" not in user, "a standalone line must not be retried"
+        return answer({n: (f"T{n}" if n != 2 else "Tanguy") for n in asked(user)})
+
+    lines = [Line(1, "He said something.", 30), Line(2, "Tanguy", 20),
+             Line(3, "And then he left.", 30)]
+    t = translator(FakeClient(responder), batch_lines=3)
+    assert t.translate(lines) == ["T1", "Tanguy", "T3"]
+    assert t.stats.echo_lines == 0
+
+
+def test_a_retry_that_echoes_again_is_not_accepted():
+    def responder(user):
+        if "is a fragment" in user:
+            return answer({int(FRAG_N.search(user)[1]): "would"})
+        return answer({n: ("would" if n == 2 else f"T{n}") for n in asked(user)})
+
+    lines = [Line(1, "okay i", 20), Line(2, "would", 20), Line(3, "like to purchase", 20)]
+    t = translator(FakeClient(responder), batch_lines=3)
+    assert t.translate(lines) == ["T1", "would", "T3"]
+    assert t.stats.echoes_fixed == 0 and t.stats.echo_retries == 1
+
+
+def test_a_retry_that_returns_the_whole_sentence_is_rejected():
+    """A fragment given the whole sentence sometimes answers with the whole sentence, which
+    would be spoken over a slot one word long."""
+    def responder(user):
+        if "is a fragment" in user:
+            n = int(FRAG_N.search(user)[1])
+            return answer({n: "je voudrais acheter un cylindre de butane de 70 litres " * 2})
+        return answer({n: ("would" if n == 2 else f"T{n}") for n in asked(user)})
+
+    lines = [Line(1, "okay i", 20), Line(2, "would", 20), Line(3, "like to purchase", 20)]
+    t = translator(FakeClient(responder), batch_lines=3)
+    assert t.translate(lines) == ["T1", "would", "T3"]
+    assert t.stats.echoes_fixed == 0
+
+
 def test_the_answer_budget_always_covers_the_estimate_and_stays_in_the_window():
     client = FakeClient(echo, num_ctx=4096)
     t = translator(client, batch_lines=4)

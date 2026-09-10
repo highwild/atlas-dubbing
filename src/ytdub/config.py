@@ -144,6 +144,10 @@ class Settings(BaseSettings):
     verify_ollama_model: str = ""
     verify_temperature: float = 0.8  # the second attempt, for a line that was echoed
     verify_echo_retries: int = 1  # 0 disables that second attempt
+    # Lines that come back in the source language: a transcribe fragment has no meaning to
+    # translate, so the model hands it back unchanged and it is spoken as-is. One retry,
+    # telling the model the line is a fragment of the sentence around it. 0 disables.
+    translation_echo_retries: int = 1
     # Set by the pipeline per language, not from the environment: where the report of
     # this pass goes (output/<file>/<lang>.verify.txt). None disables the file.
     verify_report_path: Path | None = None
