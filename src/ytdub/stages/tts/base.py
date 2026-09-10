@@ -112,6 +112,27 @@ def merge_short_fragments(segments: list[Segment], *, min_chars: int = 3,
     return segs, sorted(stuck)
 
 
+def spoken_text(text: str, language: str, *, expand_numbers: bool,
+                protected: list[str] | None = None) -> tuple[str, int]:
+    """``(text to synthesize, how many numbers were expanded)``.
+
+    The digit-to-words transform (``stages/numbers.py``) belongs here, at the TTS
+    boundary, and not in translation: the review SRT and the subtitle track keep the
+    digits, because "7.8" is quicker to scan and reads the way the number is written,
+    while the synthesizer gets "siedem przecinek osiem" — digits are unreliable to
+    pronounce (wrong grammatical case, read as a date, or skipped outright) and none of
+    that is visible in the SRT. Keeping it here also puts the changed text into the clip
+    cache key, so toggling expansion resynthesizes exactly the lines it changes and
+    nothing else.
+    """
+    if not expand_numbers:
+        return text, 0
+    from ytdub.stages.numbers import expand_text
+
+    spoken, changes = expand_text(text, language, protected=protected)
+    return spoken, len(changes)
+
+
 def clip_key(text: str, language: str, ref: SpeakerRef, ref_hash: str, tts: TTSBackend,
              seed: int) -> str:
     return hash_obj({"text": text, "lang": language, "ref": ref_hash, "tts": tts.name,
@@ -140,21 +161,32 @@ def synthesize_all(
     clip_dir: Path,
     seed: int,
     reuse: bool = True,
+    expand_numbers: bool = True,
+    protected: list[str] | None = None,
 ) -> tuple[dict[int, Path], list[int]]:
     """Synthesize (or reuse) a clip per segment. Returns ``(index -> clip, failed)``.
 
     One failed line never aborts the language; its full traceback is logged and the
     index returned in ``failed`` for the report. ``reuse=False`` (``--force``)
     resynthesizes clips that already exist.
+
+    ``expand_numbers`` applies the digit-to-words transform to what is sent to the
+    synthesizer (never to ``seg.speech_text``, which is what the SRT is written from).
+    The expanded text is what the clip is keyed on, so a line whose numbers changed is
+    synthesized again and a line whose numbers did not is still reused.
     """
     clip_dir.mkdir(parents=True, exist_ok=True)
     default = next(iter(refs))
     clips: dict[int, Path] = {}
     failed: list[int] = []
     todo = []
+    expanded: dict[int, tuple[str, int]] = {}
     for seg in segments:
         spk = seg.speaker if seg.speaker in refs else default
-        key = clip_key(seg.speech_text, language, refs[spk], ref_hashes[spk], tts, seed)
+        to_speak, count = spoken_text(seg.speech_text, language,
+                                      expand_numbers=expand_numbers, protected=protected)
+        expanded[seg.index] = (to_speak, count)
+        key = clip_key(to_speak, language, refs[spk], ref_hashes[spk], tts, seed)
         path = clip_dir / f"{key}.wav"
         if reuse and path.exists():
             clips[seg.index] = path
@@ -162,10 +194,20 @@ def synthesize_all(
             todo.append((seg, spk, path))
     if clips:
         log.info(f"[{language}] {len(clips)}/{len(segments)} clips reused from cache")
+    # Logged for every affected line, reused or not: on a resumed run the interesting
+    # question is what the synthesizer was *given*, and "it came from the cache" is not
+    # an answer. Every line's text also appears in the clip cache key, so this is a
+    # record of what the audio actually says.
+    for index in sorted(expanded):
+        spoken_line, count = expanded[index]
+        if count:
+            log.debug(f"[{language}] line {index}: speaking {spoken_line!r} "
+                      f"({count} number(s) written out; SRT text: "
+                      f"{segments[index].speech_text!r})")
 
     started = time.monotonic()
     for n, (seg, spk, path) in enumerate(todo, start=1):
-        text = seg.speech_text
+        text, _ = expanded[seg.index]
         try:
             tmp = path.with_name(path.stem + ".tmp.wav")
             problem = None
@@ -187,4 +229,9 @@ def synthesize_all(
         log.info(f"[{language}] synthesized line {n}/{len(todo)} "
                  f"({100 * n / len(todo):.0f}%) | elapsed {elapsed / 60:.1f}m | "
                  f"eta {eta / 60:.1f}m")
+    spoken = [i for i, (_, count) in expanded.items() if count]
+    if spoken:
+        log.info(f"[{language}] {len(spoken)} line(s) had digits written out for speech "
+                 f"({sum(expanded[i][1] for i in spoken)} number(s)); the SRT keeps the "
+                 f"digits. Lines: {sorted(spoken)}")
     return clips, failed

@@ -18,6 +18,10 @@ dependencies = [
     "loguru>=0.7.2",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
+    # Digits written out as words for the synthesizer (stages/numbers.py). Pure Python,
+    # no model call. Covers pl/de/fr/es/nl — not hi, which is why a language without a
+    # converter keeps its digits and says so instead of guessing.
+    "num2words>=0.5.13",
 ]
 
 [project.optional-dependencies]

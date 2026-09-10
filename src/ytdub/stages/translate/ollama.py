@@ -22,6 +22,14 @@ Robustness: output is constrained with a JSON schema and parsed strictly. A fail
 batch is split in half and retried; a single line that still fails falls back to its
 own request, and only then to the untranslated source text, which is logged. Lines are
 never dropped.
+
+Verification (``--verify``, off by default) adds the back-translation pass from
+``verify.py``: the translation is rendered back into the source language, the round trip
+is compared with the original line, and lines whose meaning changed are re-translated
+with the drift named. It is a *revision*, never a replacement: a line is only overwritten
+by a revision that parses and round-trips at least as well, so the pass can improve
+wording but can never drop, blank or degrade a line. Budget shortening still runs after
+it, because a revised line is only useful if it still fits its time slot.
 """
 
 from __future__ import annotations
@@ -35,8 +43,10 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 
 from ytdub.logging import stage_logger
+from ytdub.stages.translate import verify as verify_mod
 from ytdub.stages.translate.prompt import (
     RESPONSE_SCHEMA,
+    Hint,
     Line,
     ParseError,
     batch_prompt,
@@ -123,7 +133,7 @@ class OllamaClient:
         return None
 
     def chat(self, system: str, user: str, *, num_predict: int, schema: dict | None = None,
-             label: str = "") -> ChatResult:
+             label: str = "", temperature: float | None = None) -> ChatResult:
         system = f"Request #{next(self._counter)} {label}".strip() + "\n\n" + system
         estimate = estimate_tokens(system) + estimate_tokens(user) + _TEMPLATE_OVERHEAD
         if estimate + num_predict > self.num_ctx:
@@ -139,7 +149,8 @@ class OllamaClient:
             "think": False,
             "keep_alive": self.keep_alive,
             "options": {"num_ctx": self.num_ctx, "num_predict": num_predict,
-                        "temperature": self.temperature},
+                        "temperature": self.temperature if temperature is None
+                        else temperature},
         }
         if schema is not None:
             payload["format"] = schema
@@ -231,6 +242,17 @@ class TranslationStats:
     over_budget_final: int = 0
     repair_requests: int = 0
     glossary_misses: dict[int, list[str]] = field(default_factory=dict)
+    # Back-translation verification (all zero when it is off).
+    verified: bool = False
+    verify_backtranslations: int = 0
+    verify_comparisons: int = 0
+    verify_failures: int = 0  # requests that failed; the first attempt was kept
+    verify_echo_retries: int = 0  # second attempts after a line came back unchanged
+    flagged: int = 0  # lines whose round trip did not match the source
+    revised: int = 0  # flagged lines where the revision was kept
+    reverted: int = 0  # flagged lines where the first attempt round-tripped better
+    unverifiable: list[int] = field(default_factory=list)  # round trip never answered
+    verify_report: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -238,20 +260,35 @@ class TranslationStats:
 
 class BatchTranslator:
     def __init__(self, client: OllamaClient, *, source_lang: str, target_lang: str,
-                 style_text: str, glossary: list[str], batch_lines: int = 30,
-                 context_lines: int = 4, lookahead_lines: int = 3,
-                 budget_tolerance: float = 1.15, budget_retries: int = 2) -> None:
+                 style_text: str, glossary: list[str], hints: list[Hint] | None = None,
+                 batch_lines: int = 30, context_lines: int = 4, lookahead_lines: int = 3,
+                 budget_tolerance: float = 1.15, budget_retries: int = 2,
+                 verify: bool = False, verify_batch_lines: int = 20,
+                 verify_revision_group: int = 8,
+                 verify_client: OllamaClient | None = None,
+                 verify_retry_temperature: float = 0.8,
+                 verify_echo_retries: int = 1,
+                 verify_report_path=None) -> None:
         self.client = client
         self.src = source_lang
         self.tgt = target_lang
         self.glossary = glossary
-        self.system = system_prompt(source_lang, target_lang, style_text, glossary)
+        self.hints = hints or []
+        self.system = system_prompt(source_lang, target_lang, style_text, glossary, self.hints)
         self.batch_lines = batch_lines
         self.context_lines = context_lines
         self.lookahead_lines = lookahead_lines
         self.tolerance = budget_tolerance
         self.retries = budget_retries
-        self.stats = TranslationStats()
+        self.verify = verify
+        self.verify_batch_lines = verify_batch_lines
+        self.verify_revision_group = verify_revision_group
+        # None = verify with the translation model (the default).
+        self.verify_client = verify_client
+        self.verify_retry_temperature = verify_retry_temperature
+        self.verify_echo_retries = verify_echo_retries
+        self.verify_report_path = verify_report_path
+        self.stats = TranslationStats(verified=verify)
 
     # -- sizing ----------------------------------------------------------------
     def _fits(self, user: str, lines: list[Line]) -> tuple[bool, int]:
@@ -268,7 +305,7 @@ class BatchTranslator:
     # -- main ------------------------------------------------------------------
     def translate(self, lines: list[Line]) -> list[str]:
         """Return one translation per line, in order. Never drops a line."""
-        self.stats = TranslationStats(lines=len(lines))
+        self.stats = TranslationStats(lines=len(lines), verified=self.verify)
         if not lines:
             return []
         done: dict[int, str] = {}
@@ -291,6 +328,8 @@ class BatchTranslator:
             self._translate_batch(lines, pos, size, done)
             log.info(f"[{self.tgt}] translated {min(pos + size, len(lines))}/{len(lines)} lines")
             pos += size
+        if self.verify:
+            self._verify_translations(lines, done)
         self._repair_budgets(lines, done)
         self._check_glossary(lines, done)
         return [done[ln.n] for ln in lines]
@@ -384,17 +423,370 @@ class BatchTranslator:
                         f"{len(self.stats.glossary_misses)} lines, e.g. {sample} "
                         f"(check the review SRT; may be legitimate inflection)")
 
+    # -- back-translation verification ------------------------------------------
+    @staticmethod
+    def _chunks(numbers: list[int], size: int) -> Iterator[list[int]]:
+        for start in range(0, len(numbers), size):
+            yield numbers[start:start + size]
+
+    def _verify_translations(self, lines: list[Line], done: dict[int, str]) -> None:
+        """Round-trip every line, revise the ones whose meaning changed, cap at one round.
+
+        Failing verification is never fatal and never loses a line: a line whose back
+        translation cannot be obtained is left exactly as first translated and reported
+        as unverifiable. A revision replaces a line only when its own round trip comes
+        back clean, and it is re-verified together with the other revisions in its group,
+        which keeps the comparison in context instead of judging lines one at a time.
+        """
+        by_n = {ln.n: ln for ln in lines}
+        attempt = dict(done)  # every first-pass translation, kept for comparison
+        # Lines left in the source language by the translation fallbacks are not
+        # verified: a round trip of the source is not evidence about anything.
+        numbers = [ln.n for ln in lines if ln.n not in self.stats.untranslated]
+        if not numbers:
+            return
+        started = time.monotonic()
+        back = self._backtranslate(numbers, attempt)
+        back = self._retry_echoes(numbers, attempt, back)
+        checkable = self._checkable(numbers, attempt, back)
+        verdicts = self._compare(checkable, by_n, back)
+        # A line the comparison could not be obtained for has no verdict, so it is not
+        # flagged: it stays exactly as translated and the report says so.
+        self.stats.unverifiable = sorted(set(self.stats.unverifiable)
+                                         | (set(checkable) - set(verdicts)))
+        flagged = [n for n in numbers if n in verdicts and verdicts[n].drift]
+        self.stats.flagged = len(flagged)
+
+        drifts = [verify_mod.Drift(n=n, source=by_n[n].text, attempt=attempt[n],
+                                   back=back[n], problem=verdicts[n].problem,
+                                   term=verdicts[n].term)
+                  for n in flagged]
+        by_drift = {d.n: d for d in drifts}
+        for group in self._revision_groups(flagged):
+            revised = self._revise(group, by_n, attempt, back,
+                                   {n: by_drift[n].problem for n in group})
+            if not revised:
+                for n in group:
+                    by_drift[n].note = ("the revision could not be parsed; the first "
+                                        "attempt was kept")
+                continue
+            revised_back = self._backtranslate(sorted(revised), revised)
+            revised_back = self._retry_echoes(sorted(revised), revised, revised_back)
+            checkable = self._checkable(sorted(revised), revised, revised_back)
+            revised_verdicts = self._compare(checkable, by_n, revised_back)
+            for n in group:
+                drift = by_drift[n]
+                drift.revision = revised.get(n)
+                drift.revised_back = revised_back.get(n)
+                if n not in revised:
+                    drift.note = ("the revision could not be parsed; the first attempt "
+                                  "was kept")
+                    continue
+                if n not in revised_verdicts:
+                    drift.note = ("the revision could not be checked, so it is unproven; "
+                                  "the first attempt was kept")
+                    continue
+                if revised_verdicts[n].drift:
+                    drift.remaining = [revised_verdicts[n].problem]
+                    drift.note = "the revision drifted too; the first attempt was kept"
+                    continue
+                drift.kept = "revision"
+
+        for drift in drifts:
+            if drift.kept == "revision" and drift.revision:
+                done[drift.n] = drift.revision
+                self.stats.revised += 1
+            else:
+                self.stats.reverted += 1
+
+        unverifiable = sorted(self.stats.unverifiable)
+        self._write_verify_report(lines, drifts)
+        log.info(f"[{self.tgt}] verify: {len(numbers)} lines round-tripped, "
+                 f"{len(flagged)} flagged, {self.stats.revised} revised, "
+                 f"{self.stats.reverted} kept as first translated"
+                 + (f", {len(unverifiable)} not verifiable" if unverifiable else "")
+                 + f" ({time.monotonic() - started:.0f}s, "
+                 f"{self.stats.verify_backtranslations} back-translation and "
+                 f"{self.stats.verify_comparisons} comparison request(s))")
+        if self.stats.verify_failures:
+            log.warning(f"[{self.tgt}] verify: {self.stats.verify_failures} request(s) "
+                        "failed; those lines were left as first translated")
+        if drifts and self.stats.revised == 0:
+            log.warning(f"[{self.tgt}] verify flagged {len(drifts)} line(s) but kept no "
+                        "revision: the drift may be beyond this model (check the report)")
+        if unverifiable:
+            log.warning(f"[{self.tgt}] verify could not round-trip {len(unverifiable)} "
+                        f"line(s) {unverifiable[:8]}; they were left as translated")
+
+    def _revision_groups(self, flagged: list[int]) -> list[list[int]]:
+        """Flagged lines in contiguous groups, so neighbours are revised together (and
+        a line can still hand words to the line beside it)."""
+        groups: list[list[int]] = []
+        for n in flagged:
+            if groups and n == groups[-1][-1] + 1 \
+                    and len(groups[-1]) < self.verify_revision_group:
+                groups[-1].append(n)
+            else:
+                groups.append([n])
+        return groups
+
+    def _checkable(self, numbers: list[int], texts: dict[int, str],
+                   back: dict[int, str]) -> list[int]:
+        """Lines whose round trip is evidence: answered, and not just the input echoed
+        back (see :func:`verify.backtranslation_passed_through`). A line that fails either
+        test is recorded as unverifiable and left as translated."""
+        usable, unusable = [], []
+        for n in numbers:
+            if n not in back:
+                unusable.append(n)
+            elif verify_mod.backtranslation_passed_through(texts[n], back[n]):
+                unusable.append(n)
+                log.warning(f"[{self.tgt}] verify: line {n} came back unchanged instead "
+                            "of translated; left as translated")
+            else:
+                usable.append(n)
+        self.stats.unverifiable = sorted(set(self.stats.unverifiable) | set(unusable))
+        return usable
+
+    def _backtranslate(self, numbers: list[int], texts: dict[int, str],
+                       *, retry: bool = False) -> dict[int, str]:
+        """Literal renderings of ``texts`` back into the source language, batched."""
+        out: dict[int, str] = {}
+        system = (verify_mod.backtranslate_retry_system_prompt(self.src, self.tgt)
+                  if retry else verify_mod.backtranslate_system_prompt(self.src, self.tgt))
+
+        def build(chunk: list[int]) -> str:
+            return verify_mod.backtranslate_prompt([(n, texts[n]) for n in chunk],
+                                                   self.src, self.tgt)
+
+        for group in self._chunks(numbers, self.verify_batch_lines):
+            chunk, user = self._shrink(
+                system, group, build,
+                lambda c: self._generate_budget([texts[n] for n in c], self.src))
+            if chunk is None:
+                self._verify_unfittable(group, "back-translated")
+                continue
+            answers = self._request_lines(
+                system, user, chunk, self.src, schema=verify_mod.lines_schema(),
+                label=(f"[{self.tgt} back-translation {chunk[0]}-{chunk[-1]}"
+                       + (", retry" if retry else "") + "]"),
+                count_stat="verify_backtranslations", client=self._verify_client(),
+                temperature=self.verify_retry_temperature if retry else None)
+            if answers:
+                out.update(answers[0])
+        return out
+
+    def _retry_echoes(self, numbers: list[int], texts: dict[int, str],
+                      back: dict[int, str]) -> dict[int, str]:
+        """One second attempt for lines that came back unchanged, rephrased and hotter.
+
+        A copied line is the one failure that actively misleads: the comparison sees the
+        round trip "match" the source and confirms a wrong translation as correct. So
+        rather than only recording it as unverifiable, the pass asks again — same task,
+        framed as a translator who does not know the language, at a higher temperature,
+        which is what broke the tie when this was measured. One retry, only for the lines
+        that need it, and anything still unchanged is reported as unverifiable.
+        """
+        echoes = [n for n in numbers
+                  if n in back and verify_mod.backtranslation_passed_through(texts[n],
+                                                                            back[n])]
+        if not echoes or self.verify_echo_retries < 1:
+            return back
+        log.info(f"[{self.tgt}] verify: retrying {len(echoes)} line(s) that came back "
+                 f"untranslated: {echoes[:8]}")
+        self.stats.verify_echo_retries += 1
+        again = self._backtranslate(echoes, texts, retry=True)
+        for n in echoes:
+            if n in again and not verify_mod.backtranslation_passed_through(texts[n],
+                                                                           again[n]):
+                back[n] = again[n]
+        return back
+
+    def _compare(self, numbers: list[int], by_n: dict[int, Line],
+                 back: dict[int, str]) -> dict[int, verify_mod.Verdict]:
+        """``{n: Verdict}`` for the lines that could be round-tripped."""
+        out: dict[int, verify_mod.Verdict] = {}
+        system = verify_mod.compare_system_prompt(self.src, self.tgt)
+        for group in self._chunks(numbers, self.verify_batch_lines):
+            chunk, _ = self._shrink(
+                system, group,
+                lambda c: verify_mod.compare_prompt(
+                    [(n, by_n[n].text, back[n]) for n in c], self.src, self.tgt),
+                lambda c: self._generate_budget([back[n] for n in c], self.src))
+            if chunk is None:
+                self._verify_unfittable(group, "compared")
+                continue
+            num_predict = self._generate_budget([back[n] for n in chunk], self.src)
+            out.update(self._compare_chunk(system, chunk, back, by_n, num_predict))
+        return out
+
+    def _compare_chunk(self, system: str, numbers: list[int], back: dict[int, str],
+                       by_n: dict[int, Line],
+                       num_predict: int) -> dict[int, verify_mod.Verdict]:
+        """One comparison request, split in half while it keeps failing.
+
+        A comparison that cannot be obtained is *not* a drift verdict: the line is
+        reported as unverifiable rather than revised on no evidence. A retry of the same
+        request is not a retry — the same prompt to a deterministic server gets the same
+        unusable answer, so a failure narrows the chunk instead.
+        """
+        user = verify_mod.compare_prompt(
+            [(n, by_n[n].text, back[n]) for n in numbers], self.src, self.tgt)
+        sources = {n: by_n[n].text for n in numbers}
+        try:
+            result = self._verify_client().chat(
+                system, user, num_predict=max(num_predict, 16 * len(numbers)),
+                schema=verify_mod.COMPARISON_SCHEMA,
+                label=f"[{self.tgt} verify compare {numbers[0]}-{numbers[-1]}]")
+            self.stats.verify_comparisons += 1
+            return verify_mod.parse_comparison(result.content, sources)
+        except (ParseError, ContextOverflowError) as exc:
+            self.stats.verify_failures += 1
+            if len(numbers) > 1:
+                half = len(numbers) // 2
+                first = self._compare_chunk(system, numbers[:half], back, by_n, num_predict)
+                second = self._compare_chunk(system, numbers[half:], back, by_n, num_predict)
+                return {**first, **second}
+            log.debug(f"[{self.tgt}] verify: comparison of line {numbers[0]} unusable "
+                      f"({exc}); left as translated")
+            return {}
+
+    def _verify_client(self) -> OllamaClient:
+        """The client used for back-translation and comparison: the main model unless a
+        separate verification model is configured. Exactly one model is resident at a
+        time here — the pipeline unloads the translation model between stages, so the
+        verification model is loaded on the first verification request and used for the
+        rest of the pass."""
+        return self.verify_client or self.client
+
+    def _request_lines(self, system: str, user: str, numbers: list[int], answer_lang: str,
+                       *, schema: dict, label: str, count_stat: str | None = None,
+                       client: OllamaClient | None = None,
+                       temperature: float | None = None) -> list[dict[int, str]]:
+        """Strict answers for ``numbers``; ``[]`` when none could be obtained.
+
+        ``answer_lang`` is the language the answer is written in, which is what its size
+        has to be estimated from: a Polish answer is longer than the English source it
+        came from, and the line's character budget describes the translation, not the
+        round trip.
+        """
+        lines = [Line(n=n, text="x" * 40, budget=40) for n in numbers]
+        chat = client or self.client
+        for attempt in range(2):
+            try:
+                result = chat.chat(
+                    system, user, num_predict=output_token_estimate(lines, answer_lang) * 2,
+                    schema=schema, label=f"{label}, retry {attempt}",
+                    temperature=temperature)
+                if count_stat:
+                    setattr(self.stats, count_stat, getattr(self.stats, count_stat) + 1)
+                return [parse_lines(result.content, numbers)]
+            except (ParseError, ContextOverflowError) as exc:
+                log.debug(f"[{self.tgt}] {label} unusable ({exc})")
+                if len(numbers) > 1:
+                    half = len(numbers) // 2
+                    return (self._request_lines(system, user, numbers[:half], answer_lang,
+                                                schema=schema, label=label,
+                                                count_stat=count_stat, client=client,
+                                                temperature=temperature)
+                            + self._request_lines(system, user, numbers[half:], answer_lang,
+                                                  schema=schema, label=label,
+                                                  count_stat=count_stat, client=client,
+                                                  temperature=temperature))
+        self.stats.verify_failures += 1
+        return []
+
+    def _shrink(self, system: str, group: list[int], build, budget) -> tuple[list[int] | None, str]:
+        """Largest prefix of ``group`` whose prompt and expected answer fit ``num_ctx``.
+
+        ``budget`` maps a chunk to the answer size to allow for it. ``None`` when not
+        even one line fits — the caller then reports those lines instead of sending a
+        prompt Ollama would silently truncate.
+        """
+        size = len(group)
+        while True:
+            chunk = group[:size]
+            user = build(chunk)
+            if self._fits_prompt(system, user, budget(chunk)):
+                return chunk, user
+            if size == 1:
+                return None, user
+            size = max(1, size // 2)
+
+    def _verify_unfittable(self, numbers: list[int], action: str) -> None:
+        self.stats.verify_failures += 1
+        log.warning(f"[{self.tgt}] verify: line {numbers[0]} cannot be {action} within "
+                    f"num_ctx={self.client.num_ctx}; left as translated")
+
+    def _revise(self, numbers: list[int], by_n: dict[int, Line], attempt: dict[int, str],
+                back: dict[int, str], problems: dict[int, str]) -> dict[int, str]:
+        """Re-translate the flagged lines, telling the model what its attempt means.
+
+        The revision prompt carries the full translation system prompt (glossary, hints,
+        style) as well as the repair instructions. Without it the model repairs the named
+        drift while breaking a pinned term — rewriting a hinted "patty" as "burger" — and
+        it is only asked to revise a line at all because it got something wrong.
+
+        A revision request is neither a back-translation nor a comparison, so it is
+        counted only as a failure when it cannot be obtained at all.
+        """
+        system = f"{self.system}\n\n{verify_mod.revision_system_prompt(self.src, self.tgt)}"
+        user = verify_mod.revision_prompt(
+            [(by_n[n], attempt[n], back[n], problems[n]) for n in numbers],
+            self.src, self.tgt)
+        answers = self._request_lines(system, user, numbers, self.tgt,
+                                      schema=RESPONSE_SCHEMA,
+                                      label=f"[{self.tgt} revision {numbers[0]}-"
+                                            f"{numbers[-1]}]")
+        return answers[0] if answers else {}
+
+    def _generate_budget(self, texts: list[str], lang: str) -> int:
+        """A pessimistic allowance for an answer that renders ``texts`` in ``lang``.
+
+        A back-translation answers in the *source* language, which is not ``self.tgt``,
+        and it can be longer than the text it came from, so its size is estimated from
+        the text itself rather than from the line's character budget."""
+        return output_token_estimate(
+            [Line(n=i + 1, text=t, budget=len(t)) for i, t in enumerate(texts)], lang)
+
+    def _fits_prompt(self, system: str, user: str, num_predict: int) -> bool:
+        """The pre-send size check for a prompt that is not a translation request.
+
+        Every prompt goes through one, because Ollama truncates silently rather than
+        erroring, and a truncated verification prompt would produce a confident verdict
+        about text the model never saw.
+        """
+        need = (estimate_tokens(system) + estimate_tokens(user) + num_predict
+                + _TEMPLATE_OVERHEAD + 16)
+        return need <= self.client.num_ctx
+
+    def _write_verify_report(self, lines: list[Line], drifts: list[verify_mod.Drift]) -> None:
+        if self.verify_report_path is None:
+            return
+        from ytdub.cache import atomic_write_text
+
+        text = verify_mod.render_report(
+            self.src, self.tgt, lines, drifts, flagged=self.stats.flagged,
+            revised=self.stats.revised, unverified=self.stats.unverifiable,
+            untranslated=list(self.stats.untranslated))
+        try:
+            atomic_write_text(self.verify_report_path, text)
+            self.stats.verify_report = str(self.verify_report_path)
+            log.info(f"[{self.tgt}] verification report: {self.verify_report_path}")
+        except OSError as exc:
+            log.warning(f"[{self.tgt}] could not write the verification report: {exc}")
+
 
 def _code_hash() -> str:
-    """Hash of the prompt and orchestration code: editing either invalidates cached
-    translations even if nobody remembers to bump PROMPT_VERSION."""
+    """Hash of the prompt, verification and orchestration code: editing any of them
+    invalidates cached translations even if nobody remembers to bump PROMPT_VERSION."""
     from pathlib import Path
 
     from ytdub.cache import sha256_text
 
     here = Path(__file__).resolve().parent
     return sha256_text("".join((here / f).read_text(encoding="utf-8")
-                               for f in ("prompt.py", "ollama.py")))[:16]
+                               for f in ("prompt.py", "verify.py", "ollama.py")))[:16]
 
 
 class OllamaTranslator:
@@ -406,11 +798,30 @@ class OllamaTranslator:
         self.s = settings
         self.style_text = style_text
         self.glossary = glossary
+        # Hints are per target language, so they are set per call (see ``set_hints``).
+        self.hints: list[Hint] = []
         self.client = OllamaClient(settings.ollama_url, settings.ollama_model,
                                    num_ctx=settings.ollama_num_ctx,
                                    temperature=settings.ollama_temperature,
                                    timeout=settings.ollama_timeout)
+        # A separate model for verification only, when one is configured. Translation
+        # stays on its own model; the two never need to be resident together, because
+        # verification runs after a language's translation is finished.
+        self.verify_model = verify_model(settings)
+        self.verify_client = (
+            OllamaClient(settings.ollama_url, self.verify_model,
+                         num_ctx=settings.ollama_num_ctx,
+                         temperature=settings.ollama_temperature,
+                         timeout=settings.ollama_timeout)
+            if self.verify_model != settings.ollama_model else None)
         self._ready = False
+        self._verify_ready = False
+
+    def set_hints(self, hints: list[Hint]) -> None:
+        """``hints.<lang>.txt`` for the language about to be translated. The pipeline
+        puts the same list in that language's cache key itself, so a changed hint file
+        is a miss whether or not this is called."""
+        self.hints = list(hints)
 
     def cache_identity(self) -> dict:
         from ytdub.stages.translate.prompt import PROMPT_VERSION
@@ -422,6 +833,12 @@ class OllamaTranslator:
             "batch_lines": s.translate_batch_lines, "context_lines": s.translate_context_lines,
             "lookahead_lines": s.translate_lookahead_lines,
             "budget_tolerance": s.budget_tolerance, "budget_retries": s.budget_retries,
+            # Verification changes the output, so it is part of the key: turning it on
+            # must retranslate rather than serve a cached unverified translation. The
+            # model that verifies is part of it for the same reason.
+            "verify": s.verify, "verify_batch_lines": s.verify_batch_lines,
+            "verify_model": self.verify_model,
+            "verify_echo_retries": s.verify_echo_retries,
             "prompt_version": PROMPT_VERSION, "code": _code_hash(),
         }
 
@@ -437,13 +854,29 @@ class OllamaTranslator:
             self.client.check_model()
             self.client.verify_context_window()
             self._ready = True
+        verify_client = None
+        if self.s.verify and self.verify_client is not None:
+            if not self._verify_ready:
+                # Fails loudly before any translation if the verification model is not
+                # pulled: a pass that silently verifies with the wrong model is worse
+                # than one that never starts.
+                self.verify_client.check_model()
+                self._verify_ready = True
+            verify_client = self.verify_client
+            log.info(f"[{target_lang}] verification model: {self.verify_model} "
+                     f"(translation: {self.s.ollama_model})")
         bt = BatchTranslator(
             self.client, source_lang=source_lang, target_lang=target_lang,
-            style_text=self.style_text, glossary=self.glossary,
+            style_text=self.style_text, glossary=self.glossary, hints=self.hints,
             batch_lines=self.s.translate_batch_lines,
             context_lines=self.s.translate_context_lines,
             lookahead_lines=self.s.translate_lookahead_lines,
             budget_tolerance=self.s.budget_tolerance, budget_retries=self.s.budget_retries,
+            verify=self.s.verify, verify_batch_lines=self.s.verify_batch_lines,
+            verify_client=verify_client,
+            verify_retry_temperature=self.s.verify_temperature,
+            verify_echo_retries=self.s.verify_echo_retries,
+            verify_report_path=(self.s.verify_report_path if self.s.verify else None),
         )
         texts = bt.translate(lines)
         return texts, bt.stats.to_dict()
@@ -451,3 +884,12 @@ class OllamaTranslator:
     def unload(self) -> None:
         if self._ready:
             self.client.unload()
+        if self._verify_ready and self.verify_client is not None:
+            # Nothing is left resident: the TTS stage wants the VRAM back.
+            self.verify_client.unload()
+
+
+def verify_model(settings) -> str:
+    """The model used for the verification pass, or the translation model when no
+    separate one is configured."""
+    return settings.verify_ollama_model or settings.ollama_model

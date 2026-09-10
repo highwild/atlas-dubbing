@@ -189,15 +189,51 @@ trusted.
 
 ### Prompt inputs
 
-Two user-editable files, read at runtime, no code changes needed to edit:
+Three user-editable files, read at runtime, no code changes needed to edit:
 
 - **Glossary** — flat list of terms never to translate: channel names, game titles,
   brands, in-game currencies, people's handles. Real failures seen without one:
   "Rec Room" became "recreation room", "Atlas" was translated as the noun.
+- **Hints** (`hints.txt`, `hints.<lang>.txt`) — `term = translation` pairs for domain
+  vocabulary that recurs across videos and that the model gets wrong often enough to be
+  worth pinning ("patty", "taste buds", "craftsmanship"). The glossary says *never
+  translate this*; hints say *translate it exactly this way*. Per-language, because the
+  right rendering differs by language.
 - **Synopsis / style presets** — a short description of what the video is and how it
   should sound. Multiple presets, selected per run (e.g. casual solo, multi-person
   conversation, more formal/informative). This measurably improves the opening line,
   which otherwise has no context at all to work from.
+
+### Back-translation verification (`--verify`)
+
+Fluent target-language text that means something else is the failure class a review of
+the target text cannot catch: the error only exists *against the source*. With `--verify`
+every line is rendered back into the source language literally, that round trip is
+compared with the original line, and lines whose meaning changed are translated again
+with the drift named (source, current attempt, what that attempt actually says, and the
+specific change). The revision is verified the same way and kept only if its own round
+trip comes back clean, so the pass can improve a line but can never silently degrade one.
+One revision round, capped. Off by default: it roughly triples translation requests.
+
+Two things make it work rather than produce noise. The comparison prompt carries worked
+examples of the distinction it has to draw — different word, same thing (ok) versus a
+different thing (drift) — because without them a small model reports synonyms and
+paraphrase as changes; measured on qwen3:8b over real burger-review lines that took the
+verdict accuracy from 5/8 to 12/12. And a back-translation that comes back unchanged, or
+still in the target language, is treated as *no evidence* rather than as a match: a copied
+line would otherwise "confirm" a wrong translation as correct. Those lines are retried
+once with different instructions, and anything still unanswered is reported.
+
+Its real output is a **diagnostic**, not a repair: the revisions are low-yield, but every
+flagged line is written to `<lang>.verify.txt` with the source, the attempt, what that
+attempt means and the specific change — which is a list of terms worth pinning in
+`hints.txt`. The pass also suggests the terms it verified a fix for, with the line that
+fixed them, since a term plus a rendering it has actually confirmed is the one thing it
+knows better than the reader does.
+
+Because verification is a check rather than a translation, and never has to be resident
+with the translator, it can run on a larger model than the translation does
+(`verify_ollama_model`).
 
 ### Why this fixes the literalness
 
@@ -485,7 +521,7 @@ Sensible defaults, all commercially licensed, all configurable:
 | Transcription | faster-whisper `large-v3` | Same weights as OpenAI Whisper, faster inference. Support passing a local model directory, not just a size name — auto-download is a common failure point. |
 | Translation | Qwen 3 8B via Ollama | Apache 2.0. Disable reasoning/thinking mode, and strip `<think>` blocks defensively. Low temperature (~0.3). |
 | Voice cloning | Chatterbox multilingual | Best local option found. Supports the target languages. |
-| Diarization | Embedding-based clustering | Token-free. A pyannote path can be offered but must not be required, since it needs a HuggingFace token and terms acceptance. |
+| Diarization | pyannote, falling back to embedding clustering | pyannote is the default because it separates similar voices and the embedding clusterer does not (measured: it merged two different men at 0.76 similarity against a 0.75 threshold). It needs a HuggingFace token and terms acceptance, so with no token the run warns once and falls back to the token-free clusterer — offered and default, but still not required. |
 
 Every model choice should be swappable via config. Assume better options will exist in
 six months.

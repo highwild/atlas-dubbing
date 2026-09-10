@@ -30,15 +30,31 @@ def _parser() -> argparse.ArgumentParser:
     job = p.add_argument_group("job")
     job.add_argument("--style", help="style preset from synopses/ (default: casual)")
     job.add_argument("--speakers", type=int, metavar="N",
-                     help="multi-voice mode with N speakers (0 = auto-detect)")
+                     help="number of voices: 0 = count them with the diarizer (default), "
+                          "1 = treat the file as one speaker, N = force N")
     job.add_argument("--source", metavar="LANG", help="source language (default: auto-detect)")
     job.add_argument("--ref", action="append", default=[], metavar="[SPK=]PATH",
                      help="voice reference clip, e.g. --ref atlas.wav or --ref SPK1=guest.wav")
+    job.add_argument("--speaker-map", dest="speaker_map", metavar="LINES=SPK,...",
+                     help="re-label lines after diarization, e.g. "
+                          "'6-15=SPK1,22=SPK3' (1-based review-SRT line numbers)")
+    job.add_argument("--voice", metavar="PATH",
+                     help="your own voice clip (file or folder): matched to whichever "
+                          "speaker sounds like it, so the per-file SPK label never has to "
+                          "be named. Also YTDUB_VOICE")
     review = p.add_argument_group("review loop")
     review.add_argument("--srt-only", action="store_true",
                         help="stop after translation; write <lang>.review.srt for checking")
     review.add_argument("--from-review", action="store_true",
                         help="dub from the (edited) <lang>.review.srt files, skipping translation")
+    review.add_argument("--verify", action="store_true",
+                        help="back-translate the translation and revise lines whose meaning "
+                             "drifted (about three times the translation time; writes "
+                             "<lang>.verify.txt). Also YTDUB_VERIFY=1")
+    review.add_argument("--verify-model", dest="verify_ollama_model", metavar="MODEL",
+                        help="model for the verification pass only (default: the "
+                             "translation model). A bigger model is affordable here: it is "
+                             "only ever resident after translation is done")
     cache = p.add_argument_group("cache")
     cache.add_argument("--force", "--no-cache", dest="force", action="store_true",
                        help="ignore every cached result and recompute")
@@ -61,6 +77,10 @@ def _parser() -> argparse.ArgumentParser:
                       help="match loudness to this file (e.g. the full mix when dubbing a stem)")
     tune.add_argument("--no-loudness", action="store_true", help="skip loudness matching")
     tune.add_argument("--no-mux", action="store_true", help="never write the preview .mp4")
+    tune.add_argument("--no-number-expansion", dest="no_number_expansion", action="store_true",
+                      help="send digits to the synthesizer as digits instead of writing "
+                           "them out as words (also YTDUB_EXPAND_NUMBERS=0). The SRT is "
+                           "unaffected either way")
     tune.add_argument("--device", help="cuda or cpu (default: auto)")
     net = p.add_argument_group("network / running")
     net.add_argument("--allow-ipv6", action="store_true", help="do not force IPv4")
@@ -81,7 +101,9 @@ def _usage(p: argparse.ArgumentParser, settings: Settings) -> None:
         print(f"\nFiles in {settings.input_dir}:" + ("".join(f"\n  {f}" for f in files) or "\n  (empty)"))
     print("\nExamples:\n  dub solo.wav\n  dub chat.wav --style duo --speakers 2\n"
           "  dub doc.wav --style professional de fr\n  dub talk.wav --srt-only de pl   "
-          "# then edit output/talk/de.review.srt\n  dub talk.wav --from-review de pl")
+          "# then edit output/talk/de.review.srt\n  dub talk.wav --from-review de pl\n"
+          "  dub solo.wav --srt-only pl --verify   # back-translation check + "
+          "output/solo/pl.verify.txt")
 
 
 def _parse_refs(values: list[str]) -> dict[str | None, Path]:
@@ -121,13 +143,17 @@ def main(argv: list[str] | None = None) -> int:
         "min_confidence": args.min_confidence, "loudness_reference": args.loudness_reference,
         "device": args.device, "cookies_from_browser": args.cookies_from_browser,
         "tts_backend": args.tts_backend, "translator": args.translator,
+        "verify_ollama_model": args.verify_ollama_model, "voice": args.voice,
+        "speaker_map": args.speaker_map or None,
     }.items() if v is not None}
     if args.langs:
         overrides["languages"] = [lang.lower() for lang in args.langs]
     for flag, key, value in ((args.force, "force", True), (args.separate, "separate", True),
                              (args.no_loudness, "match_loudness", False),
                              (args.no_mux, "mux_video", False),
-                             (args.allow_ipv6, "force_ipv4", False)):
+                             (args.allow_ipv6, "force_ipv4", False),
+                             (args.verify, "verify", True),
+                             (args.no_number_expansion, "expand_numbers", False)):
         if flag:
             overrides[key] = value
     settings = Settings(**overrides)

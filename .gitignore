@@ -238,3 +238,9 @@ nohup.out
 
 # pipeline working data (caches, clips, references)
 /work/
+
+# Your own voice recordings: personal, and useless to anyone else.
+/voices/
+
+# Task notes kept locally, not part of the tool.
+/VERIFY_TASK.md

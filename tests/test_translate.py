@@ -15,17 +15,30 @@ from ytdub.stages.translate.ollama import (
     OllamaClient,
 )
 from ytdub.stages.translate.prompt import (
+    Hint,
     Line,
     ParseError,
     batch_prompt,
     estimate_tokens,
     glossary_misses,
     load_glossary,
+    load_hints,
     lower_bound_tokens,
+    merge_hints,
     needs_repair,
     parse_lines,
     repair_groups,
     system_prompt,
+)
+from ytdub.stages.translate.verify import (
+    Drift,
+    Verdict,
+    backtranslate_prompt,
+    collect_hints,
+    compare_prompt,
+    parse_comparison,
+    render_report,
+    revision_prompt,
 )
 
 # Lines the model is asked to return carry a budget tag; context lines do not.
@@ -121,6 +134,31 @@ def test_batch_prompt_shows_budgets_context_and_lookahead():
 
 def test_glossary_file_format():
     assert load_glossary("# c\nAtlas\n\n  Rec Room  \n#x") == ["Atlas", "Rec Room"]
+
+
+def test_hints_file_format_and_merge():
+    parsed = load_hints("# comment\ntaste buds = kubki smakowe\n\nnot a hint\nbroken =\n"
+                        "  patty  =  kotlet  \ncraftsmanship = rzemiosło")
+    assert parsed == [Hint("taste buds", "kubki smakowe"), Hint("patty", "kotlet"),
+                      Hint("craftsmanship", "rzemiosło")]
+    merged = merge_hints([Hint("patty", "kotlet"), Hint("bun", "bułka")],
+                         [Hint("Patty", "plaster mięsa")])
+    assert {(h.term, h.translation) for h in merged} == {("Patty", "plaster mięsa"),
+                                                         ("bun", "bułka")}
+
+
+def test_hints_are_injected_into_the_system_prompt_beside_the_glossary():
+    sp = system_prompt("en", "pl", "", ["Rec Room"], [Hint("patty", "kotlet")])
+    assert "- Rec Room" in sp and "- patty => kotlet" in sp
+    assert sp.index("Do not translate") < sp.index("patty => kotlet")
+    assert "patty => kotlet" not in system_prompt("en", "pl", "", ["Rec Room"], [])
+
+
+def test_hints_change_the_prompt_not_just_the_paragraph():
+    # Same lines, different hints: the model must be told something different.
+    a = system_prompt("en", "pl", "", [], [Hint("patty", "kotlet")])
+    b = system_prompt("en", "pl", "", [], [Hint("patty", "plaster")])
+    assert a != b
 
 
 def test_glossary_misses():
@@ -229,68 +267,333 @@ def test_glossary_misses_are_recorded():
     assert t.stats.glossary_misses == {1: ["Rec Room"]}
 
 
-# --- Ollama client safety checks ----------------------------------------------------
+# --- back-translation verification ------------------------------------------------
+#
+# A stand-in model that really does round-trip: the first pass renders source lines
+# "S<n>" as target lines "T<n>", the back-translation renders "T<n>" as "S<n>", and the
+# comparison calls a round trip a drift unless the two agree. That is enough to drive
+# the whole pass deterministically, including the case it exists for: a first pass that
+# is fluent and wrong (line 1 -> "T1bad", which round-trips to "S1bad").
 
 
-def _client(**kw) -> OllamaClient:
-    return OllamaClient("http://127.0.0.1:11434", "qwen3:8b", num_ctx=kw.pop("num_ctx", 8192),
-                        temperature=0.3, timeout=5, **kw)
+class VerifyFake:
+    """Fake Ollama client whose three request kinds behave differently.
+
+    ``round_trip`` is the model's opinion of what a target line means; it is what makes
+    a first pass "fluent but wrong" (``T1`` means ``X1``, not ``S1``). A revision request
+    answers with ``revised(n)``, which by default round-trips correctly — a fake model
+    that is told what drifted produces a *better* second attempt, which is what the pass
+    is for and what makes "keep the better attempt" testable.
+    """
+
+    def __init__(self, *, broken_numbers=(), fail_compare=frozenset(), revised=None):
+        self.broken = set(broken_numbers)  # line numbers whose text means something else
+        self.repaired = set()  # line numbers a revision request has answered for
+        self.fail_compare = fail_compare  # None = every comparison fails
+        self.revised = revised or (lambda n: f"T{n}rev")
+        self.num_ctx = 8192
+        self.calls: list[str] = []
+
+    def round_trip(self, target_text: str) -> str:
+        """What the model thinks ``target_text`` means. ``T<n>`` means ``S<n>``, unless
+        line ``n`` is broken *and* unrepaired (then it means ``X<n>`` — fluent, and not
+        what the source said, which is the whole failure this pass exists for)."""
+        match = re.match(r"^T(\d+)(bad)?", target_text)
+        if not match:
+            return f"meaning of {target_text}"
+        n = int(match.group(1))
+        if match.group(2) and n in self.broken and n not in self.repaired:
+            return f"X{n}"
+        return f"S{n}"
+
+    def chat(self, system, user, *, num_predict, schema=None, label="",
+             temperature=None):
+        self.calls.append(user)
+        if "back-translator" in system:
+            rows = re.findall(r"^(\d+)\. (.*)$", user, re.M)
+            return ChatResult(answer({int(n): self.round_trip(t) for n, t in rows}),
+                              100, 10, "stop")
+        if "problem:" in user:  # a revision request (checked before the comparison)
+            rows = re.findall(r"^(\d+)\. \[≤\d+\]", user, re.M)
+            self.repaired.update(int(n) for n in rows)
+            return ChatResult(answer({int(n): self.revised(int(n)) for n in rows}),
+                              100, 10, "stop")
+        if "Check each" in user:
+            triples = re.findall(r"^(\d+)\. source \([^)]*\): (.*)\n +back-translation "
+                                 r"\([^)]*\): (.*)$", user, re.M)
+            if self.fail_compare is None or any(int(n) in self.fail_compare
+                                                for n, _, _ in triples):
+                return ChatResult("not json", 100, 10, "stop")
+            return ChatResult(json.dumps({"lines": [
+                {"n": int(n), "verdict": "drift" if a != b else "ok",
+                 "problem": "" if a == b else f"{a} became {b}"}
+                for n, a, b in triples]}), 100, 10, "stop")
+        rows = re.findall(r"^(\d+)\. \[≤\d+\] (?:\[SPK\d\] )?(.*)$", user, re.M)
+        return ChatResult(answer({int(n): f"T{n}bad" if int(n) in self.broken else f"T{n}"
+                                  for n, _ in rows}), 100, 10, "stop")
 
 
-def test_every_request_sets_num_ctx_and_disables_thinking(monkeypatch):
-    client = _client()
-    sent = []
-
-    def fake_stream(path, payload):
-        sent.append(payload)
-        yield {"message": {"content": '{"lines": []}'}, "done": False}
-        yield {"message": {"content": ""}, "done": True, "done_reason": "stop",
-               "prompt_eval_count": 500, "eval_count": 5}
-
-    monkeypatch.setattr(client, "_stream", fake_stream)
-    client.chat("system " * 50, "user " * 50, num_predict=100)
-    client.chat("system " * 50, "user " * 50, num_predict=100)
-    for payload in sent:
-        assert payload["options"]["num_ctx"] == 8192
-        assert payload["think"] is False
-    # Unique prefix per request, so a cached prefix never shrinks prompt_eval_count.
-    firsts = [p["messages"][0]["content"].splitlines()[0] for p in sent]
-    assert firsts[0] != firsts[1]
+def verified(client, **kw) -> BatchTranslator:
+    return translator(client, verify=True, **kw)
 
 
-def test_prompt_too_big_is_refused_before_sending(monkeypatch):
-    client = _client(num_ctx=1000)
-    monkeypatch.setattr(client, "_stream", lambda *a: pytest.fail("must not send"))
-    with pytest.raises(ContextOverflowError):
-        client.chat("s", "word " * 2000, num_predict=100)
+def test_verification_flags_and_revises_a_line_that_does_not_round_trip():
+    client = VerifyFake(broken_numbers={1})
+    t = verified(client)
+    lines = [Line(1, "S1", 60), Line(2, "S2", 60)]
+    out = t.translate(lines)
+    assert out == ["T1rev", "T2"]  # the bad line was replaced by its revision
+    assert t.stats.flagged == 1 and t.stats.revised == 1 and t.stats.reverted == 0
+    revision = next(u for u in client.calls if "problem:" in u)
+    assert "current Polish: T1bad" in revision
+    assert "back-translation of the current line (English): X1" in revision
+    assert "problem: S1 became X1" in revision
+
+def test_a_revision_that_does_not_help_is_not_kept():
+    class StillWrong(VerifyFake):
+        def round_trip(self, target_text: str) -> str:
+            if target_text.endswith("rev"):
+                return "still the wrong meaning"
+            return super().round_trip(target_text)
+
+    # The revision round-trips as badly as the first attempt (the verdict names it), so
+    # there is no evidence it is an improvement and the first attempt stands.
+    t = verified(StillWrong(broken_numbers={1}))
+    out = t.translate([Line(1, "S1", 60)])
+    assert out == ["T1bad"]
+    assert t.stats.flagged == 1 and t.stats.revised == 0 and t.stats.reverted == 1
 
 
-def _respond(client, monkeypatch, prompt_eval_count, eval_count=5):
-    def fake_stream(path, payload):
-        yield {"message": {"content": "ok"}, "done": True, "done_reason": "stop",
-               "prompt_eval_count": prompt_eval_count, "eval_count": eval_count}
-    monkeypatch.setattr(client, "_stream", fake_stream)
+def test_verification_off_by_default_sends_no_extra_requests():
+    client = VerifyFake()
+    t = translator(client)
+    t.translate([Line(1, "S1", 60), Line(2, "S2", 60)])
+    assert len(client.calls) == 1  # one translation batch, nothing else
+    assert not t.stats.verified and t.stats.flagged == 0
 
 
-def test_server_side_truncation_is_detected(monkeypatch):
-    client = _client()
-    # Server claims to have read 300 tokens of a ~9000-character prompt: truncated.
-    _respond(client, monkeypatch, 300)
-    with pytest.raises(ContextOverflowError, match="truncated"):
-        client.chat("sys", "word " * 1800, num_predict=50)
+def test_verification_writes_a_report_of_what_it_found(tmp_path):
+    path = tmp_path / "pl.verify.txt"
+    t = verified(VerifyFake(broken_numbers={1}, revised=lambda n: "T1bad"),
+                 verify_report_path=path)
+    t.translate([Line(1, "on the actual patty", 60)])
+    report = path.read_text(encoding="utf-8")
+    assert "flagged 1 line(s)" in report
+    for expected in ("on the actual patty", "first attempt (Polish)", "T1bad",
+                     "what that means (English)", "X1", "problem:", "became X1",
+                     "kept:"):
+        assert expected in report, expected
+    assert t.stats.verify_report == str(path)
 
 
-def test_prompt_plus_answer_over_window_is_detected(monkeypatch):
-    client = _client(num_ctx=8192)
-    _respond(client, monkeypatch, 8000, eval_count=400)
-    with pytest.raises(ContextOverflowError):
-        client.chat("sys", "word " * 100, num_predict=50)
+def test_verification_report_is_written_even_when_nothing_is_flagged(tmp_path):
+    path = tmp_path / "pl.verify.txt"
+    t = verified(VerifyFake(), verify_report_path=path)
+    t.translate([Line(1, "S1", 60)])
+    assert "nothing was flagged" in path.read_text(encoding="utf-8")
 
 
-def test_context_calibration(monkeypatch):
-    client = _client(num_ctx=8192)
-    _respond(client, monkeypatch, 4096)  # server stuck at its default window
-    with pytest.raises(ContextOverflowError, match="calibration"):
-        client.verify_context_window()
-    _respond(client, monkeypatch, 4950)  # read the whole ~4915-word probe
-    client.verify_context_window()
+def test_a_failed_comparison_is_not_a_drift_verdict():
+    # No verdict about a line is no evidence, so it is left exactly as translated and
+    # reported; it is never "revised" on the strength of a comparison that failed.
+    t = verified(VerifyFake(fail_compare={1}))
+    assert t.translate([Line(1, "S1", 60)]) == ["T1"]
+    assert t.stats.unverifiable == [1] and t.stats.flagged == 0
+    assert t.stats.verify_failures >= 1
+
+
+def test_one_uncomparable_line_does_not_stop_the_others():
+    t = verified(VerifyFake(fail_compare={1}))
+    out = t.translate([Line(1, "S1", 60), Line(2, "S2", 60), Line(3, "S3", 60)])
+    assert out == ["T1", "T2", "T3"]
+    assert t.stats.unverifiable == [1] and t.stats.flagged == 0
+
+
+def test_a_failed_back_translation_never_loses_a_line():
+    class NoBack(VerifyFake):
+        def chat(self, system, user, **kw):
+            if "back-translator" in system:
+                self.calls.append(user)
+                return ChatResult("garbage", 100, 10, "stop")
+            return super().chat(system, user, **kw)
+
+    t = verified(NoBack())
+    lines = [Line(1, "S1", 60), Line(2, "S2", 60)]
+    out = t.translate(lines)
+    assert out == ["T1", "T2"]
+    assert t.stats.unverifiable == [1, 2] and t.stats.flagged == 0
+
+
+def test_a_back_translation_that_echoes_the_input_is_not_evidence():
+    # Asked to render Polish into English, the model sometimes copies the Polish line.
+    # A copied line "matches" the source trivially, so treating it as a verdict would
+    # confirm a wrong translation as correct - the opposite of the point.
+    class Echoes(VerifyFake):
+        def chat(self, system, user, **kw):
+            if "back-translator" in system:
+                self.calls.append(user)
+                rows = re.findall(r"^(\d+)\. (.*)$", user, re.M)
+                return ChatResult(answer({int(n): t for n, t in rows}), 100, 10, "stop")
+            return super().chat(system, user, **kw)
+
+    t = verified(Echoes(), verify_echo_retries=0)
+    out = t.translate([Line(1, "S1", 60), Line(2, "S2", 60)])
+    assert out == ["T1", "T2"]
+    assert t.stats.unverifiable == [1, 2] and t.stats.flagged == 0
+    assert t.stats.verify_comparisons == 0  # nothing usable to compare
+    assert t.stats.verify_echo_retries == 0  # the second attempt was disabled
+
+
+def test_an_echoed_line_is_retried_once_and_can_still_be_verified():
+    """The failure worth fixing: a line the model would not translate back at all.
+
+    The retry uses different instructions and a higher temperature, so it is a genuinely
+    different attempt rather than the same request sent twice.
+    """
+
+    class EchoesFirst(VerifyFake):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.systems: list[str] = []
+            self.temperatures: list[float | None] = []
+
+        def chat(self, system, user, *, num_predict, schema=None, label="",
+                 temperature=None):
+            if "back-translator" in system or "no Polish vocabulary" in system:
+                self.calls.append(user)
+                self.systems.append(system)
+                self.temperatures.append(temperature)
+                rows = re.findall(r"^(\d+)\. (.*)$", user, re.M)
+                if "no Polish vocabulary" in system:  # the retry: translate properly
+                    return ChatResult(answer({int(n): self.round_trip(t)
+                                              for n, t in rows}), 100, 10, "stop")
+                return ChatResult(answer({int(n): t for n, t in rows}), 100, 10, "stop")
+            return super().chat(system, user, num_predict=num_predict, schema=schema,
+                                label=label, temperature=temperature)
+
+    client = EchoesFirst(broken_numbers={1})
+    t = verified(client)
+    out = t.translate([Line(1, "S1", 60), Line(2, "S2", 60)])
+    # One retry round for the first pass, one for the re-verification of the revision:
+    # never a second retry of the same text.
+    assert t.stats.verify_echo_retries == 2
+    assert t.stats.unverifiable == []
+    # Two attempts per round - the first pass and the re-verification of the revision -
+    # and the retry is always a different prompt at a hotter setting.
+    assert len(client.systems) == 4
+    assert client.systems[0] != client.systems[1]
+    assert client.temperatures[0] is None and client.temperatures[1] == 0.8
+    # Line 1 is still flagged - but now on evidence instead of on silence.
+    assert t.stats.flagged == 1
+    assert out == ["T1rev", "T2"]
+
+
+def test_passthrough_check_ignores_punctuation_and_case():
+    from ytdub.stages.translate.verify import backtranslation_passed_through
+
+    assert backtranslation_passed_through("Sztuczność tego burgera.",
+                                          "sztuczność  tego burgera")
+    assert not backtranslation_passed_through("Sztuczność tego burgera",
+                                              "The artificiality of this burger")
+
+
+def test_a_verified_revision_produces_a_suggested_hint(tmp_path):
+    """The loop the pass exists for: a line drifts, the revision fixes it, and the report
+    offers the term it was about together with the line that fixed it."""
+
+    class Termed(VerifyFake):
+        """A verifier that names the term, over a model that translates the first attempt
+        wrongly and the revision correctly."""
+
+        def round_trip(self, target_text: str) -> str:
+            if target_text == "T1bad":
+                return "little teeth are fine"
+            if target_text == "T1rev":
+                return "taste buds are fine"
+            return "WRONG"
+
+        def chat(self, system, user, *, num_predict, schema=None, label="",
+                 temperature=None):
+            if "Check each" in user:
+                self.calls.append(user)
+                triples = re.findall(r"^(\d+)\. source \([^)]*\): ([^\n]*)\n +back-translation "
+                                     r"\([^)]*\): ([^\n]*)$", user, re.M)
+                same = [(n, a, b) for n, a, b in triples if a != b]
+                return ChatResult(json.dumps({"lines": [
+                    {"n": int(n), "verdict": "drift", "problem": "the meaning changed",
+                     "term": "taste buds"} for n, _, _ in same] + [
+                    {"n": int(n), "verdict": "ok", "problem": "", "term": ""}
+                    for n, a, b in triples if a == b]}), 100, 10, "stop")
+            return super().chat(system, user, num_predict=num_predict, schema=schema,
+                                label=label, temperature=temperature)
+
+    path = tmp_path / "pl.verify.txt"
+    t = verified(Termed(broken_numbers={1}), verify_report_path=path)
+    t.translate([Line(1, "taste buds are fine", 60)])
+    report = path.read_text(encoding="utf-8")
+    assert t.stats.revised == 1
+    assert "# Suggested hints from this run." in report
+    # The term, the line the pass verified as the fix, and the attempt it replaced.
+    assert "#   taste buds = <- from: T1rev" in report
+    assert "#   taste buds was: T1bad" in report
+
+
+def test_hints_are_only_suggested_from_a_verified_revision():
+    # The evidence rule: the term is flagged, and the revision it points at round-tripped
+    # clean. A first attempt is never suggested as the rendering to pin - the pass has
+    # already decided that wording is wrong, and pinning it would make the error
+    # permanent.
+    verified_revision = Drift(n=1, source="taste buds it's all right",
+                              attempt="kubki smakowe, jest ok",
+                              back="taste buds, is ok", problem="taste buds became taste buds",
+                              term="taste buds", revision="kubki smakowe są w porządku",
+                              revised_back="taste buds are in order", kept="revision")
+    reverted = Drift(n=2, source="the patty was dry", attempt="bułka była sucha",
+                     back="the bun was dry", problem="patty became bun", term="patty",
+                     revision="kotlet był suchy", revised_back="the cutlet was dry",
+                     kept="attempt")
+    hints, unpinned = collect_hints([verified_revision, reverted])
+    assert hints == [("taste buds", "kubki smakowe, jest ok", "kubki smakowe są w porządku")]
+    assert unpinned == ["patty"]
+
+    text = render_report("en", "pl", [Line(1, "x", 10)], [verified_revision, reverted],
+                         flagged=2, revised=1, unverified=[9], untranslated=[])
+    suggested = text.split("Suggested hints")[1]
+    assert "#   taste buds = <- from: kubki smakowe są w porządku" in suggested
+    assert "#   taste buds was: kubki smakowe, jest ok" in suggested
+    assert "check these by hand: patty" in suggested
+    assert "lines [9] could not be checked" in suggested
+    assert "patty was:" not in suggested  # an unverified attempt is never offered
+
+
+def test_there_is_no_hint_block_without_a_verified_revision():
+    # A run that flags lines but keeps no revision has nothing with evidence behind it,
+    # and says so instead of offering the wording it just rejected.
+    drift = Drift(n=1, source="on the actual patty", attempt="na kiełbasie",
+                  back="on the sausage", problem="patty became sausage", term="patty",
+                  revision="na kotlecie", revised_back="on the cutlet",
+                  note="the revision drifted too; the first attempt was kept")
+    hints, unpinned = collect_hints([drift])
+    assert hints == [] and unpinned == ["patty"]
+    text = render_report("en", "pl", [Line(1, "x", 10)], [drift], flagged=1, revised=0,
+                         unverified=[], untranslated=[])
+    block = text.split("=" * 78)[-1]
+    assert "No lines were revised and verified this run" in block
+    assert "na kiełbasie" not in block  # the rejected attempt is not offered as a hint
+    assert "na kotlecie" not in block
+
+
+def test_the_hint_block_is_written_even_when_nothing_drifted(tmp_path):
+    path = tmp_path / "pl.verify.txt"
+    t = verified(VerifyFake(), verify_report_path=path)
+    t.translate([Line(1, "S1", 60)])
+    report = path.read_text(encoding="utf-8")
+    assert "nothing was flagged" in report
+    assert "No lines were revised and verified this run" in report
+
+
+def test_leaked_thinking_tokens_are_stripped_from_the_report():
+    from ytdub.stages.translate.verify import clean_text
+
+    assert clean_text("and green leaves /no_think") == "and green leaves"
+    assert clean_text("<think>hmm</think> the bun") == "the bun"

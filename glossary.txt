@@ -30,3 +30,9 @@ YouTube
 Discord
 Twitch
 Steam
+
+# --- rail terms that should stay English (hydro job) ---
+Severn Valley Railway
+SVR
+Hydroshunter
+Kidderminster

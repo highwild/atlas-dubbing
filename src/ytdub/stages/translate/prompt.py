@@ -10,7 +10,8 @@ import re
 from dataclasses import dataclass
 
 # Bump when prompt wording changes, so cached translations are invalidated.
-PROMPT_VERSION = 1
+# 2: hints (term = translation) section; back-translation verification.
+PROMPT_VERSION = 2
 
 LANG_NAMES = {
     "en": "English", "de": "German", "fr": "French", "es": "Spanish", "pl": "Polish",
@@ -41,6 +42,15 @@ class Line:
     text: str  # source text
     budget: int  # character budget for the translation
     speaker: str | None = None
+
+
+@dataclass
+class Hint:
+    """A ``term = translation`` pair from ``hints.txt``: how to translate one domain
+    term, as opposed to the glossary's do-not-translate-at-all."""
+
+    term: str
+    translation: str
 
 
 # --- Token estimation ----------------------------------------------------------
@@ -79,7 +89,7 @@ _NON_LATIN = {"hi", "zh", "ja", "ko", "ar", "ru", "uk", "el", "he", "th"}
 
 
 def system_prompt(source_lang: str, target_lang: str, style_text: str,
-                  glossary: list[str]) -> str:
+                  glossary: list[str], hints: list[Hint] | None = None) -> str:
     src, tgt = lang_name(source_lang), lang_name(target_lang)
     parts = [
         f"You are a professional dubbing translator working from {src} into {tgt}.",
@@ -109,6 +119,11 @@ def system_prompt(source_lang: str, target_lang: str, style_text: str,
     if glossary:
         parts += ["", "Do not translate these terms. Reproduce them exactly as written:"]
         parts += [f"- {term}" for term in glossary]
+    if hints:
+        parts += ["",
+                  f"Use these specific {tgt} renderings whenever the term appears (or is "
+                  "clearly implied by it). Match the inflected form the sentence needs:"]
+        parts += [f"- {h.term} => {h.translation}" for h in hints]
     return "\n".join(parts)
 
 
@@ -285,6 +300,35 @@ def load_glossary(text: str) -> list[str]:
     """One term per line; ``#`` starts a comment line."""
     return [s for s in (line.strip() for line in text.splitlines())
             if s and not s.startswith("#")]
+
+
+def load_hints(text: str) -> list[Hint]:
+    """``term = translation`` per line; ``#`` starts a comment line.
+
+    The term may contain spaces (``taste buds = kubki smakowe``). A line without an
+    ``=``, or with an empty side, is not a hint — it is skipped rather than guessed at,
+    so a typo costs one entry instead of corrupting the prompt.
+    """
+    hints: list[Hint] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        term, _, translation = line.partition("=")
+        term, translation = term.strip(), translation.strip()
+        if term and translation:
+            hints.append(Hint(term, translation))
+    return hints
+
+
+def merge_hints(base: list[Hint], override: list[Hint]) -> list[Hint]:
+    """``override`` wins on the same term (case-insensitively), so a per-language file
+    can correct the shared one. Ordered by term, so the prompt (and its cache key) does
+    not depend on the order the files happen to list entries in."""
+    merged: dict[str, Hint] = {}
+    for hint in (*base, *override):
+        merged[hint.term.casefold()] = hint
+    return sorted(merged.values(), key=lambda h: h.term.casefold())
 
 
 def load_style(text: str) -> str:

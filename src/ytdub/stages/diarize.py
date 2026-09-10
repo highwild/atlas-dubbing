@@ -106,6 +106,64 @@ def cluster_embeddings(embeddings, num_speakers: int = 0, threshold: float = 0.7
     return labels
 
 
+def parse_speaker_map(spec: str) -> list[tuple[int, int, str]]:
+    """``"6-15=SPK3,22=SPK1"`` -> ``[(6, 15, "SPK3"), (22, 22, "SPK1")]``.
+
+    Line numbers are the SRT's (1-based). Raises ``ValueError`` on anything malformed:
+    a wrong boundary silently applied to the wrong lines is worse than a failed job.
+    """
+    entries: list[tuple[int, int, str]] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(f"--speaker-map {chunk!r} is missing '='")
+        where, _, speaker = chunk.partition("=")
+        speaker = speaker.strip()
+        if not speaker:
+            raise ValueError(f"--speaker-map {chunk!r} has no speaker label")
+        first, sep, last = where.strip().partition("-")
+        try:
+            start = int(first)
+            end = int(last) if sep else start
+        except ValueError as exc:
+            raise ValueError(f"--speaker-map {chunk!r}: line numbers must be integers") from exc
+        if start < 1 or end < start:
+            raise ValueError(f"--speaker-map {chunk!r}: need 1 <= first <= last")
+        entries.append((start, end, speaker))
+    if not entries:
+        raise ValueError("--speaker-map is empty")
+    for (a, b, _), (c, d, _) in zip(entries, entries[1:]):
+        if c <= b:
+            raise ValueError(f"--speaker-map overlaps: {a}-{b} and {c}-{d}")
+    return entries
+
+
+def apply_speaker_map(segments: list[Segment], spec: str) -> list[Segment]:
+    """Re-label the lines ``spec`` names, leaving every other line as diarized.
+
+    Necessary because diarization gets boundaries wrong on crosstalk and on similar
+    voices, and no amount of re-clustering fixes a stretch the model merged: the person
+    who watched the video knows which lines are whose, and this is how they say so.
+    """
+    if not spec.strip():
+        return segments
+    entries = parse_speaker_map(spec)
+    out = list(segments)
+    for start, end, speaker in entries:
+        if end > len(out):
+            raise ValueError(f"--speaker-map {start}-{end} is past the end of the "
+                             f"transcript ({len(out)} lines)")
+        for i in range(start - 1, end):
+            out[i] = replace(out[i], speaker=speaker)
+    counts: dict[str, int] = {}
+    for seg in out:
+        counts[seg.speaker] = counts.get(seg.speaker, 0) + 1
+    log.success(f"speaker map applied: {counts}")
+    return out
+
+
 def fill_short_labels(segments: list[Segment], labels: dict[int, int]) -> list[int]:
     """Label per segment; segments missing from ``labels`` take the nearest labelled one."""
     labelled = [s for s in segments if s.index in labels]
@@ -152,17 +210,102 @@ def diarize_embedding(audio_path: Path, segments: list[Segment], *, num_speakers
     return out
 
 
+def _accept_legacy_hub_token() -> None:
+    """Let pyannote 3.x talk to huggingface_hub 1.x.
+
+    pyannote passes ``use_auth_token=`` to ``hf_hub_download``; huggingface_hub 1.0
+    removed that name in favour of ``token``, so the call raises ``TypeError`` before any
+    download starts. pyannote 4 fixes it but needs torch>=2.8, which the production
+    Chatterbox pin (torch 2.6) forbids, and our transformers pin requires
+    huggingface_hub>=1.3 — so neither side can move and the argument is translated
+    instead. Every pyannote module that did ``from huggingface_hub import
+    hf_hub_download`` holds its own reference, so each is patched where it looks.
+    """
+    import sys
+
+    import huggingface_hub
+
+    def shim_for(original):
+        if getattr(original, "_ytdub_token_shim", False):
+            return None
+
+        def shim(*args, _original=original, use_auth_token=None, **kwargs):
+            if use_auth_token is not None and "token" not in kwargs:
+                kwargs["token"] = use_auth_token
+            return _original(*args, **kwargs)
+
+        shim._ytdub_token_shim = True
+        shim._ytdub_wrapped = original
+        return shim
+
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("pyannote") or module is None:
+            continue
+        original = getattr(module, "hf_hub_download", None)
+        if original is None:
+            continue
+        shim = shim_for(original)
+        if shim is not None:
+            setattr(module, "hf_hub_download", shim)
+    # And the hub module itself, for anything that calls it as an attribute.
+    shim = shim_for(huggingface_hub.hf_hub_download)
+    if shim is not None:
+        huggingface_hub.hf_hub_download = shim
+
+
+def _allow_pyannote_checkpoints() -> None:
+    """Let pyannote 3.x load its own checkpoints under torch>=2.6.
+
+    torch 2.6 flipped ``torch.load``'s default to ``weights_only=True``; pyannote's
+    released checkpoints carry a handful of ordinary pyannote classes, which the safe
+    unpickler refuses unless they are allowlisted, so loading raises ``UnpicklingError``
+    naming the class it wants. These are pyannote's official weights from the gated HF
+    repos; the narrow fix is to allowlist the classes the loader asks for, one per round,
+    rather than switching the safe loader off entirely.
+    """
+    import torch
+
+    wanted = ["torch.torch_version.TorchVersion",
+              "pyannote.audio.core.task.Specifications",
+              "pyannote.audio.core.task.Problem",
+              "pyannote.audio.core.task.Resolution"]
+    allowed = []
+    for dotted in wanted:
+        module_name, _, class_name = dotted.rpartition(".")
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            allowed.append(getattr(module, class_name))
+        except Exception:
+            log.debug(f"pyannote checkpoint class not available: {dotted}")
+    if allowed:
+        torch.serialization.add_safe_globals(allowed)
+
+
+def _ensure_hub_token(token: str) -> None:
+    """Export the token for the hub, in both the current and legacy variable names.
+
+    pyannote's own download calls carry no token through to huggingface_hub, so the
+    environment is what authenticates the gated model fetch.
+    """
+    os.environ.setdefault("HF_TOKEN", token)
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", token)
+
+
 def diarize_pyannote(audio_path: Path, segments: list[Segment], *, num_speakers: int = 0,
                      device: str = "cpu", hf_token: str | None = None) -> list[Segment]:
+    import pyannote.audio.core.model  # noqa: F401  (imported so the token shim can reach it)
     from pyannote.audio import Pipeline
 
     from ytdub.gpu import free_memory
 
-    token = hf_token or os.getenv("HF_TOKEN")
+    token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     if not token:
-        raise RuntimeError("pyannote diarization needs a Hugging Face token (HF_TOKEN) and "
-                           "accepted terms at hf.co/pyannote/speaker-diarization-3.1")
-    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+        raise RuntimeError("pyannote diarization needs a Hugging Face token (YTDUB_HF_TOKEN) "
+                           "and accepted terms at hf.co/pyannote/speaker-diarization-3.1")
+    _ensure_hub_token(token)
+    _accept_legacy_hub_token()
+    _allow_pyannote_checkpoints()
+    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
     if device == "cuda":
         import torch
 

@@ -1233,6 +1233,18 @@ wheels = [
 ]
 
 [[package]]
+name = "num2words"
+version = "0.5.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "docopt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/58/ad645bd38b4b648eb2fc2ba1b909398e54eb0cbb6a7dbd2b4953e38c9621/num2words-0.5.14.tar.gz", hash = "sha256:b066ec18e56b6616a3b38086b5747daafbaa8868b226a36127e0451c0cf379c6", size = 218213, upload-time = "2024-12-17T20:17:10.191Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/5b/545e9267a1cc080c8a1be2746113a063e34bcdd0f5173fd665a5c13cb234/num2words-0.5.14-py3-none-any.whl", hash = "sha256:1c8e5b00142fc2966fd8d685001e36c4a9911e070d1b120e1beb721fa1edb33d", size = 163525, upload-time = "2024-12-17T20:17:06.074Z" },
+]
+
+[[package]]
 name = "numba"
 version = "0.67.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2858,6 +2870,7 @@ version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "loguru" },
+    { name = "num2words" },
     { name = "numpy" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -2894,6 +2907,7 @@ requires-dist = [
     { name = "diffusers", marker = "extra == 'ml'", specifier = "==0.29.0" },
     { name = "faster-whisper", marker = "extra == 'ml'", specifier = ">=1.1.0" },
     { name = "loguru", specifier = ">=0.7.2" },
+    { name = "num2words", specifier = ">=0.5.13" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pyannote-audio", marker = "extra == 'pyannote'", specifier = ">=3.3" },
     { name = "pydantic", specifier = ">=2.6" },

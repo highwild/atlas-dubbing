@@ -1,0 +1,12 @@
+# Polish renderings for recurring vocabulary (see hints.txt for the format).
+# This file wins over hints.txt for the same term.
+
+# --- burger / food reviews ---
+patty = kotlet
+taste buds = kubki smakowe
+craftsmanship = rzemiosło
+
+# --- rail terms (hydro job): grammar forms verified, see COMMANDS.md ---
+shunter = lokomotywa manewrowa
+shunting = manewry
+heritage railway = kolej zabytkowa

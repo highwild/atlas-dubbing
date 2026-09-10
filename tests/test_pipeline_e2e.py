@@ -48,11 +48,18 @@ def translate_text(src: str, lang: str) -> str:
     return SHORT.get(src, f"{src} ({lang} und so weiter)")
 
 
+def answer(texts: dict[int, str]) -> str:
+    return json.dumps({"lines": [{"n": n, "text": t} for n, t in texts.items()]})
+
+
 class FakeOllama:
     digest = "sha256:aaaa"
+    built: list[str] = []
 
     def __init__(self, url, model, *, num_ctx, **kw):
         self.num_ctx = num_ctx
+        self.model = model
+        FakeOllama.built.append(model)
 
     def model_digest(self):
         return FakeOllama.digest
@@ -66,12 +73,22 @@ class FakeOllama:
     def unload(self):
         CALLS["unload"] += 1
 
-    def chat(self, system, user, *, num_predict, schema=None, label=""):
+    def chat(self, system, user, *, num_predict, schema=None, label="", temperature=None):
         from ytdub.stages.translate.ollama import ChatResult
 
         CALLS["translate"] += 1
         lang = "pl" if "Polish" in system else "de"
         rows = re.findall(r"^(\d+)\. \[≤\d+\] (?:\[SPK\d\] )?(?:source: )?(.*)$", user, re.M)
+        if "back-translator" in system:
+            # Verification asks for the numbered lines with their numbers and nothing
+            # else prepended, and answers in the source language.
+            nums = re.findall(r"^(\d+)\. ", user, re.M)
+            return ChatResult(answer({int(n): f"back {n}" for n in nums}), 1000, 100, "stop")
+        if "Check each" in user:
+            nums = re.findall(r"^(\d+)\. source ", user, re.M)
+            return ChatResult(json.dumps({"lines": [
+                {"n": int(n), "verdict": "ok", "problem": "", "term": ""}
+                for n in nums]}), 1000, 100, "stop")
         out = [{"n": int(n), "text": translate_text(t.strip(), lang)} for n, t in rows]
         return ChatResult(json.dumps({"lines": out}), 1000, 100, "stop")
 
@@ -84,6 +101,7 @@ class FakeTTS:
     supported_languages = {"de", "pl"}
     fail_on: set[str] = set()
     chars_per_sec = 14.0
+    seen: list[str] = []  # every string actually sent to the synthesizer
 
     def __init__(self, settings):
         self.settings = settings
@@ -96,6 +114,7 @@ class FakeTTS:
         from ytdub.stages.tts.base import spoken_chars
 
         CALLS["tts"] += 1
+        FakeTTS.seen.append(text)
         if text in self.fail_on:
             raise RuntimeError("simulated TTS crash")
         assert ref.exists()
@@ -141,6 +160,8 @@ def _patch_models(monkeypatch):
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     CALLS.clear()
+    FakeOllama.built = []
+    FakeTTS.seen = []
     FakeTTS.fail_on = set()
     FakeTTS.chars_per_sec = 14.0
     FakeOllama.digest = "sha256:aaaa"
@@ -160,9 +181,16 @@ def home(tmp_path, monkeypatch):
 
 
 def settings(home, **kw) -> Settings:
+    """Test settings, deliberately blind to the developer's .env.
+
+    ``_env_file=None`` matters: without it a checkout whose .env names a voice clip, a
+    Hugging Face token and a diarizer would quietly change what these tests exercise, and
+    the token-free embedding diarizer is pinned here because that is the path a fresh
+    clone gets.
+    """
     base = dict(home=home, languages=["de", "pl"], speakers=2, device="cpu", style="casual",
-                tts_backend=f"{__name__}:FakeTTS")
-    return Settings(**{**base, **kw})
+                diarize_method="embedding", tts_backend=f"{__name__}:FakeTTS")
+    return Settings(_env_file=None, **{**base, **kw})
 
 
 def run(home, input_name="talk.wav", **kw):
@@ -276,6 +304,78 @@ def test_unrelated_settings_keep_the_cached_translation(home):
     before = CALLS.copy()
     run(home, languages=["de"], srt_only=True, max_ratio=1.1, ollama_url="http://127.0.0.2:1")
     assert CALLS["translate"] == before["translate"]
+
+
+def test_hints_change_invalidates_translation_only(home):
+    (home / "hints.txt").write_text("# shared\npatty = kotlet\n", encoding="utf-8")
+    run(home, languages=["de", "pl"], srt_only=True)
+    before = CALLS.copy()
+    run(home, languages=["de", "pl"], srt_only=True)
+    assert CALLS["translate"] == before["translate"]  # unchanged hints and order
+    # The per-language file wins, and only that language is retranslated.
+    (home / "hints.pl.txt").write_text("patty = plaster mięsa\n", encoding="utf-8")
+    run(home, languages=["de", "pl"], srt_only=True)
+    assert CALLS["translate"] > before["translate"]
+    assert CALLS["transcribe"] == before["transcribe"]
+    assert CALLS["diarize"] == before["diarize"]
+
+
+def test_hints_reach_the_translation_prompt(home):
+    (home / "hints.pl.txt").write_text("taste buds = kubki smakowe\n", encoding="utf-8")
+    prompts: list[str] = []
+    original = FakeOllama.chat
+
+    def record(self, system, user, **kw):
+        prompts.append(system)
+        return original(self, system, user, **kw)
+
+    FakeOllama.chat = record
+    try:
+        run(home, languages=["pl"], srt_only=True)
+    finally:
+        FakeOllama.chat = original
+    polish = [p for p in prompts if "Polish" in p and "back-translator" not in p]
+    assert polish and all("- taste buds => kubki smakowe" in p for p in polish)
+    assert not any("taste buds =>" in p for p in prompts if "German" in p)
+
+
+def test_verify_runs_the_pass_and_writes_a_report(home):
+    results, _ = run(home, languages=["pl"], srt_only=True, verify=True)
+    out = home / "output" / "talk"
+    assert results["pl"].status == "srt-only"
+    stats = results["pl"].translation
+    assert stats["verified"] is True
+    assert stats["verify_backtranslations"] > 0 and stats["verify_comparisons"] > 0
+    assert stats["flagged"] == 0 and stats["unverifiable"] == []
+    report = (out / "pl.verify.txt").read_text(encoding="utf-8")
+    assert "nothing was flagged" in report
+    assert stats["verify_report"].endswith("pl.verify.txt")
+
+
+def test_no_verify_no_report_and_no_extra_requests(home):
+    (home / "output" / "talk").mkdir(parents=True, exist_ok=True)
+    (home / "output" / "talk" / "pl.verify.txt").write_text("stale run\n", encoding="utf-8")
+    results, _ = run(home, languages=["pl"], srt_only=True)
+    assert results["pl"].translation["verified"] is False
+    unverified_requests = CALLS["translate"]
+    # Off by default: only the translation (and any budget repair) is asked for; turning
+    # verification on can only add requests on top of that.
+    run(home, languages=["pl"], srt_only=True, verify=True, force=True)
+    assert CALLS["translate"] > unverified_requests
+    # A cached (unverified) translation cannot leave an older report looking current.
+    (home / "output" / "talk" / "pl.verify.txt").write_text("stale run\n", encoding="utf-8")
+    run(home, languages=["pl"], srt_only=True)  # still cached from the first run above
+    assert not (home / "output" / "talk" / "pl.verify.txt").exists()
+
+
+def test_toggling_verify_invalidates_the_cached_translation(home):
+    run(home, languages=["pl"], srt_only=True)
+    before = CALLS.copy()
+    run(home, languages=["pl"], srt_only=True, verify=True)
+    assert CALLS["translate"] > before["translate"]
+    verified = CALLS["translate"]
+    run(home, languages=["pl"], srt_only=True, verify=True)
+    assert CALLS["translate"] == verified  # the verified result is cached in turn
 
 
 def test_cached_translation_survives_ollama_being_down(home, monkeypatch):
@@ -417,3 +517,157 @@ def test_video_input_writes_wav_and_srt_before_mux(home, monkeypatch):
     _patch_models(monkeypatch)
     results, _ = run(home, "clip.mp4", languages=["de"])
     assert results["de"].status == "ok" and (out / "de.mp4").exists()
+
+
+def test_verify_model_is_separate_and_in_the_cache_key(home):
+    from ytdub.stages.translate.ollama import OllamaTranslator
+
+    cfg = settings(home, verify=True, verify_ollama_model="qwen3:14b")
+    translator = OllamaTranslator(cfg, "A casual video.", [])
+    assert translator.cache_identity()["verify_model"] == "qwen3:14b"
+    # A second client for the other model; translation keeps its own.
+    assert translator.verify_client is not None
+    assert translator.verify_client.model == "qwen3:14b"
+    assert translator.client.model == cfg.ollama_model
+
+    results, _ = run(home, languages=["pl"], srt_only=True, verify=True,
+                     verify_ollama_model="qwen3:14b")
+    assert results["pl"].translation["verified"] is True
+    assert set(FakeOllama.built) == {cfg.ollama_model, "qwen3:14b"}
+
+    # Changing only the verification model retranslates: a different checker can reach a
+    # different verdict.
+    before = CALLS.copy()
+    run(home, languages=["pl"], srt_only=True, verify=True,
+        verify_ollama_model="other:latest")
+    assert CALLS["translate"] > before["translate"]
+
+    # With none configured, the translator verifies with its own model, as before.
+    plain = OllamaTranslator(settings(home, verify=True), "A casual video.", [])
+    assert plain.verify_client is None
+    assert plain.cache_identity()["verify_model"] == settings(home).ollama_model
+
+
+def _numbered_script(*texts):
+    """A fake transcript whose lines contain the digits this pass is about."""
+    def fake(audio_path, **kw):
+        from ytdub.stages.transcribe import Transcript
+
+        CALLS["transcribe"] += 1
+        segs = [Segment(i, 0.5 + i * 3.0, 0.5 + i * 3.0 + 2.5, t, confidence=0.9)
+                for i, t in enumerate(texts)]
+        return Transcript(segments=segs, language="en", dropped=[])
+
+    return fake
+
+
+def test_digits_are_spoken_but_the_srt_keeps_them(home, monkeypatch):
+    """The whole point: the synthesizer gets words, the reviewer and the viewer get
+    digits. Both files come out of one run, so this is the check that they can diverge."""
+    from ytdub.stages import transcribe
+
+    monkeypatch.setattr(transcribe, "transcribe",
+                        _numbered_script("give that a 4.5 overall",
+                                         "out of 10 brown leaves"))
+    results, _ = run(home, languages=["pl"])
+    assert results["pl"].status == "ok"
+
+    spoken = " | ".join(FakeTTS.seen)
+    assert "cztery przecinek pięć" in spoken, FakeTTS.seen
+    assert "dziesięć" in spoken, FakeTTS.seen
+
+    out = home / "output" / "talk"
+    srt = (out / "pl.srt").read_text(encoding="utf-8")
+    review = (out / "pl.review.srt").read_text(encoding="utf-8")
+    assert "4.5" in srt and "10" in srt          # the subtitle track viewers see
+    assert "4.5" in review                       # what the reviewer reads
+    assert "cztery przecinek" not in srt and "cztery przecinek" not in review
+    # The line numbers and the digit count are reported so a wrong expansion is
+    # findable in the log without listening to the whole dub.
+    assert any("digits written out for speech" in line
+               for line in (out / "dub.log").read_text(encoding="utf-8").splitlines())
+
+
+def test_number_expansion_can_be_turned_off(home, monkeypatch):
+    from ytdub.stages import transcribe
+
+    monkeypatch.setattr(transcribe, "transcribe", _numbered_script("give that a 4.5 overall"))
+    results, _ = run(home, languages=["pl"], expand_numbers=False)
+    assert results["pl"].status == "ok"
+    assert "4.5" in " | ".join(FakeTTS.seen)          # digits went to the synthesizer
+    assert "cztery przecinek" not in " | ".join(FakeTTS.seen)
+    # And the SRT is the same either way.
+    assert "4.5" in (home / "output" / "talk" / "pl.srt").read_text(encoding="utf-8")
+
+
+def test_toggling_number_expansion_resynthesizes_only_the_lines_it_changes(home, monkeypatch):
+    from ytdub.stages import transcribe
+
+    monkeypatch.setattr(transcribe, "transcribe",
+                        _numbered_script("give that a 4.5 overall", "no numbers here"))
+    run(home, languages=["pl"])
+    assert CALLS["tts"] == 2
+    before = CALLS["tts"]
+    # Off: the line with the number changes, the other is reused from the clip cache.
+    run(home, languages=["pl"], expand_numbers=False)
+    assert CALLS["tts"] == before + 1
+
+
+def test_a_stored_voice_is_matched_to_its_speaker_not_named(home, monkeypatch):
+    """The point of `--voice`: the diarizer's label for you changes between files, so the
+    clip is attached by voice instead of by SPK number. Matching itself is unit-tested in
+    test_voices.py; here the check is that a match reaches the references and the cache."""
+    clip = home / "voices" / "atlas.wav"
+    clip.parent.mkdir()
+    sf.write(clip, np.zeros(24000, dtype=np.float32), 24000)   # a real, if silent, clip
+    seen: dict = {}
+
+    def fake_match_voice(path, refs, **kw):
+        # Called with the *pipeline's own* reference cuts: that is what makes the match
+        # work at all, so it is the contract worth pinning here.
+        seen["path"] = path
+        seen["refs"] = list(refs)
+        # Pretend the voice was matched to SPK1, which is not the label a naive
+        # --ref SPK0=... would have used, and that SPK1's label also covers a second
+        # label the diarizer split off.
+        return {"SPK1": clip}, [("SPK0", "SPK1")]
+
+    monkeypatch.setattr("ytdub.stages.voices.match_voice", fake_match_voice)
+    results, job = run(home, languages=["de"], srt_only=True, speakers=2, voice=clip, force=True)
+    assert results["de"].status == "srt-only", results["de"]
+
+    assert seen["path"] == clip
+    assert seen["refs"] == sorted(seen["refs"]), "references must exist before matching"
+    assert job.refs["SPK1"].path == clip
+    assert job.refs["SPK1"].origin == "matched"
+    # Folded away, and no segment is left carrying the label that disappeared.
+    assert "SPK0" not in job.refs
+    assert {s.speaker for s in job.segments} == {"SPK1"}
+    assert job.speaker_fold == {"SPK0": "SPK1"}
+
+
+def test_one_speaker_and_a_voice_clip_uses_the_clip(home, monkeypatch):
+    """`--speakers 1 --voice you.wav` is the podcast case: no diarization, and the clip you
+    supplied is the voice for the whole file. Matching would be theatre — the answer is
+    already known — so no encoder is loaded and there is nothing to get wrong."""
+    clip = home / "voices" / "atlas.wav"
+    clip.parent.mkdir()
+    sf.write(clip, np.zeros(24000, dtype=np.float32), 24000)
+    monkeypatch.setattr("ytdub.stages.voices.match_voice",
+                        lambda *a, **k: pytest.fail("must not match with one speaker"))
+    results, job = run(home, languages=["de"], srt_only=True, speakers=1, voice=clip)
+    assert results["de"].status == "srt-only"
+    assert set(job.refs) == {None}
+    assert job.refs[None].path == clip
+    assert job.refs[None].origin == "your clip (single speaker)"
+    assert "using atlas.wav for the whole file" in (
+        home / "output" / "talk" / "dub.log").read_text(encoding="utf-8")
+
+
+def test_a_missing_voice_file_falls_back_to_the_automatic_reference(home):
+    # A path that does not resolve is worth a warning, not a dead job.
+    results, job = run(home, languages=["de"], srt_only=True, speakers=1,
+                       voice=home / "voices" / "nope.wav")
+    assert results["de"].status == "srt-only"
+    assert "no audio file found" in (home / "output" / "talk" / "dub.log").read_text(
+        encoding="utf-8")

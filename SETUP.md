@@ -131,16 +131,29 @@ Only edited lines are resynthesized if clips from an earlier run exist.
 
 ## Voices
 
-With `--speakers`, speakers are labelled `SPK0`, `SPK1`, ... once per source file and
-the same labels and voice references are used for every language. The chosen
-reference for each speaker is logged with its time range. To use a known-good
-recording instead (recommended for a recurring presenter, for consistency between
-uploads):
+Voices are counted by the diarizer by default, so a multi-speaker file needs no flags.
+Speakers are labelled `SPK0`, `SPK1`, ... once per source file and the same labels and
+voice references are used for every language. The chosen reference for each speaker is
+logged with its time range.
+
+Diarization defaults to `pyannote`, which needs a free Hugging Face token in `.env` as
+`YTDUB_HF_TOKEN=hf_...` **and** the terms accepted at
+`hf.co/pyannote/speaker-diarization-3.1`. Without a token the run says so and falls back
+to the token-free embedding diarizer, which is measurably worse at separating two similar
+voices. Force either per run with `YTDUB_DIARIZE_METHOD=pyannote|embedding`.
+
+To use a known-good recording instead (recommended for a recurring presenter, for
+consistency between uploads) — named by label, or attached by voice so the per-file label
+never has to be known:
 
 ```bash
-dub solo.wav --ref voices/atlas.wav
-dub chat.wav --speakers 2 --ref SPK0=voices/atlas.wav
+dub2 solo.wav --ref voices/atlas.wav
+dub2 chat.wav --speakers 2 --ref SPK0=voices/atlas.wav
+dub2 chat.wav --voice voices/atlas.wav        # matched to whoever sounds like you
 ```
+
+`--speakers 1` means one speaker: no diarization, and `--voice` then applies to the whole
+file. `--speakers 0` (the default) counts the voices.
 
 ## Long jobs
 
@@ -156,12 +169,136 @@ command again: completed stages, translations and synthesized clips are reused.
 ## Editable config (no code changes)
 
 - `glossary.txt`: terms never to translate (channel names, games, brands, handles).
+- `hints.txt`, `hints.<lang>.txt`: how to translate specific terms (`patty = kotlet`),
+  for every language or for one. See "Translation quality" below.
 - `synopses/*.txt`: style presets. Each has a description of the video and its tone,
   and a "Locale rules" section (numbers, currency, dates, units). A new `.txt` file
   appears as a `--style` option automatically.
 - `.env` / `YTDUB_*` environment variables: every setting in `src/ytdub/config.py`,
   e.g. `YTDUB_MAX_RATIO=1.15`, `YTDUB_OLLAMA_MODEL=qwen3:14b`,
-  `YTDUB_LANGUAGES='["de","fr"]'`, `YTDUB_MIN_CONFIDENCE=0.5`.
+  `YTDUB_LANGUAGES='["de","fr"]'`, `YTDUB_MIN_CONFIDENCE=0.5`, `YTDUB_VERIFY=1`,
+  `YTDUB_EXPAND_NUMBERS=0`.
+
+## Spoken numbers
+
+Digits are written out as words for the synthesizer, deterministically, with no model
+call. The translation prompt asks for this and both models ignore it, and the failure is
+only audible at the end of the pipeline: multilingual TTS reads a digit in the wrong
+grammatical case, mistakes it for a date, or skips it — and the review SRT shows nothing.
+
+```
+SRT (you and the viewer):   Daję 4,5, bo dziś czuje się szorstko
+audio (the synthesizer):    Daję cztery przecinek pięć, bo dziś czuje się szorstko
+```
+
+It runs at the TTS boundary — after translation, after verification, after budget
+shortening — so it never touches the translated text, the review file or the subtitle
+track. Budgets are decided before it: expansion only ever makes a line longer, and the
+fitter already exists to absorb a longer line into the silence around it, so the extra
+characters are its job rather than something to plan the budgets around. Every affected
+line is logged (debug for the exact text, info for the count and line numbers), so a wrong
+expansion is diagnosable from `dub.log` without listening to the whole dub.
+
+Left as digits on purpose: clock times (`7:30`), versions and IPs (`4.5.1`), dates
+(`10.06.2024`), ranges (`3-4`), percentages (`100%`), units and model numbers (`12GB`,
+`1080p`, `RTX 3080`), and any digit inside a glossary or hints term. Turn the whole thing
+off with `--no-number-expansion` or `YTDUB_EXPAND_NUMBERS=0`; the SRT is identical either
+way, and only the lines whose numbers changed are resynthesized.
+
+**Language coverage.** `num2words` has a converter for pl, de, fr, es and nl. It does
+**not** have one for Hindi (every call raises `NotImplementedError` on 0.5.14), so Hindi
+keeps its digits. That is logged rather than guessed at: a wrong number read confidently
+is worse than a digit the TTS might handle.
+
+Polish needs more than `num2words` can give, because its cardinals inflect: after `z`,
+`około`, `od`, `do` and similar prepositions the number must be genitive, and
+`num2words` only produces the nominative. "10 brown leaves" as a rating is `z dziesięciu`,
+not `z dziesięć`. A small table covers 0-999, which is the range this content uses;
+anything larger is left as a digit rather than said wrongly. If you speak Polish, that
+table is the thing to check — it is in `stages/numbers.py` next to the prepositions that
+trigger it. German, French, Spanish and Dutch need nothing: their cardinals are the same
+form in every position.
+
+## Translation quality
+
+A translation can be fluent, idiomatic and wrong. `hints.txt` pins the recurring
+vocabulary; `--verify` catches the rest.
+
+`hints.txt` holds `term = translation` pairs for domain words that come up across videos:
+`patty`, `taste buds`, `craftsmanship`. They are injected into the translation prompt, so
+they beat the model's own guess on the day. A per-language override goes in
+`hints.<lang>.txt` (`hints.pl.txt`, `hints.de.txt`), which wins over the shared file for
+the same term. Both are optional: `#` starts a comment line, a line without an `=` is
+skipped rather than guessed at, and a missing or empty file is not an error.
+
+`--verify` (or `YTDUB_VERIFY=1`) adds *back-translation verification*. After translating,
+each line is rendered back into the source language **literally**, that round trip is
+compared with the original line, and lines whose meaning changed are translated again with
+the drift named to the model:
+
+```
+source:          on the actual patty
+current:         na kiełbasiu
+back-translation: on the sausage
+problem:         patty became sausage
+```
+
+The revision is then verified the same way and kept only if its own round trip comes back
+clean; otherwise the first attempt stands, so the pass can improve a line but never
+silently degrade one. It costs roughly three times the translation time — small next to
+synthesis, which is why `--srt-only` makes it cheap to try:
+
+```bash
+dub cheese.wav --srt-only pl --verify     # writes output/cheese/pl.verify.txt
+```
+
+**Use it as a diagnostic.** Expect it to flag more lines than it can fix — on real
+content the repairs are low-yield — but the flags are the point: the report ends with the
+terms it caught, next to the one line it managed to verify as the fix.
+
+```
+# Suggested hints from this run.
+# Each entry is a term this pass flagged, and the line it verified as the
+# fix. Copy the term and the words of that line that render it into
+# hints.txt ...
+#   craftsmanship = <- from: Rzemiosło tego burgera
+#   taste buds = <- from: kubki smakowe są w porządku
+```
+
+That block stops one step short of paste-ready on purpose. What the pass knows for
+certain is the term (flagged on meaning, checked against the source line) and the line
+that fixed it (verified by its own round trip). Which words of that line render the term
+is the judgement call the comparison model itself only manages about half the time, so
+guessing it here would put confident wrong pairs in front of someone about to make them
+permanent. On a run that flags lines but keeps no revision, the block says so and lists
+the terms to check by hand instead.
+
+Lines the pass could not check at all are listed at the top of the report. That happens
+when the model answers the back-translation request by copying its input instead of
+translating it; the pass retries those lines once, rephrased and at a higher temperature
+(`verify_temperature`, one retry per round, `verify_echo_retries=0` to disable), and
+reports whatever is still unanswered rather than pretending silence is agreement.
+
+### A bigger model for the check, not for the translation
+
+Verification is a check, not a translation, and the two never need to be resident at the
+same time: translation finishes and unloads before the pass runs. So the pass can use a
+model the translator cannot afford:
+
+```bash
+dub video.wav --srt-only pl --verify --verify-model qwen27-24k:latest
+# or YTDUB_VERIFY_OLLAMA_MODEL=... , which needs no --verify-model
+```
+
+Translation stays on `ollama_model` (`qwen3:8b` by default). With no verification model
+set — the default — the translator verifies with its own model, exactly as before.
+Whichever model is used is part of the translation cache key, so changing it retranslates.
+If the named model is not pulled, the job fails before translating rather than quietly
+verifying with the wrong one.
+
+Verification on/off, its prompts, its batch size and its model are part of the translation
+cache key, as are both hint files, so toggling it or editing a hint retranslates rather
+than serving a result from before the change.
 
 ## What invalidates what
 
@@ -175,11 +312,13 @@ the log names the inputs that changed. Tests cover each translation input.
 - **Voice references:** the diarization key, sha256 of each `--ref` file, reference
   target/min seconds.
 - **Translation (per language):** the transcription and diarization keys (source text,
-  timings, speaker tags), source and target language, sha256 of the style file and of
-  `glossary.txt`, translator backend name, and the backend's own identity. For Ollama
-  that is the model name, `num_ctx`, temperature, batch/context/lookahead line counts,
-  budget tolerance and retries, `PROMPT_VERSION`, and a hash of the translator's
-  source code. It also includes the per-line character budgets and the settings they
+  timings, speaker tags), source and target language, sha256 of the style file, of
+  `glossary.txt` and of that language's hints (shared file + `hints.<lang>.txt`),
+  translator backend name, and the backend's own identity. For Ollama that is the model
+  name, `num_ctx`, temperature, batch/context/lookahead line counts, budget tolerance and
+  retries, `verify`, `verify_batch_lines`, the verification model, `verify_echo_retries`,
+  `PROMPT_VERSION`, and a hash of the translator's source code (prompts, verification and
+  orchestration). It also includes the per-line character budgets and the settings they
   come from: `chars_per_second`, `budget_max_borrow`, `min_gap`. The Ollama *weights
   digest* is stored with the result: a re-pulled model with the same name is
   retranslated. If Ollama is unreachable the digest can't be checked and the cached
@@ -206,8 +345,13 @@ dub talk.wav de --translator mypkg.mt:OtherMT     # or YTDUB_TRANSLATOR=...
 
 A TTS backend is built as `cls(settings)` and needs `name`, a class-level
 `supported_languages`, `cache_identity()`, `synthesize(text, ref, language, out_path,
-seed)` and `unload()`. The tests load their fake TTS and a fake translator exactly this
-way. Check the licence of anything you drop in: XTTS and NLLB are non-commercial.
+seed)` and `unload()`. A translator is built as `cls(settings, style_text, glossary)` and
+needs `name`, `cache_identity()`, `weights_fingerprint()`, `translate(lines,
+source_lang=..., target_lang=...)` and `unload()`. `set_hints(hints)` is optional: a
+translator without it still works, it just logs that the hints were ignored (the hints are
+in the cache key either way, so that cannot cause a stale hit). The tests load their fake
+TTS and a fake translator exactly this way. Check the licence of anything you drop in:
+XTTS and NLLB are non-commercial.
 
 ## Loudness
 
@@ -251,6 +395,11 @@ and Whisper output; Ollama honouring `think: false` with a JSON schema; the
   speech was dropped, lower `--min-confidence`.
 - LLMs treat character budgets loosely. Over-budget lines are re-requested, and the
   fitter absorbs the rest into silence, compressing only when it must.
+- `--verify` needs the model twice per line and is only as good as the model's judgement:
+  it can miss a drift it does not recognise, and it will not overwrite a line it cannot
+  prove is better, so a stubborn line stays as first translated and is named in
+  `<lang>.verify.txt`. It also runs *after* translation and *before* budget shortening,
+  so a kept revision can still be shortened afterwards.
 
 # Local patches from the fork, and where they went
 

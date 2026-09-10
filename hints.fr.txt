@@ -1,0 +1,11 @@
+# French renderings for recurring vocabulary (see hints.txt for the format).
+# This file wins over hints.txt for the same term.
+
+# --- rail terms (hydro job) ---
+# "shunter" appears 15+ times and came out three different ways without this.
+shunter = locomotive de manœuvre
+shunting = manœuvres
+heritage railway = chemin de fer touristique
+fuel cell = pile à combustible
+state of charge = état de charge
+buffer beams = traverses de choc

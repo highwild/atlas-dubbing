@@ -121,6 +121,69 @@ def extract_region(audio_path: Path, region: Region, out_path: Path,
     return len(clip) / sr
 
 
+def _merge_fold(merges: list[tuple[str, str]], protected: set[str]) -> dict[str, str]:
+    """``{label: surviving label}`` for every label folded away, transitively.
+
+    ``merges`` are ``(other, keeper)`` pairs; a chain (SPK3->SPK2, SPK2->SPK1) collapses to
+    one target, because the alternative is a segment remapped onto a label that itself
+    disappears. A label the caller named explicitly (``--ref SPK3=...``) is never folded
+    away: that is a person stating which voice they want, and no similarity score
+    outranks it.
+    """
+    parent: dict[str, str] = {label: label for pair in merges for label in pair}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for other, keeper in merges:
+        if other in protected or keeper in protected:
+            log.warning(f"not folding {other} into {keeper}: both were named explicitly")
+            continue
+        parent[find(other)] = find(keeper)
+    return {label: find(label) for label in parent if find(label) != label}
+
+
+def apply_matches(
+    refs: dict[str | None, SpeakerRef],
+    segments: list[Segment],
+    *,
+    matched: dict[str, Path],
+    merges: list[tuple[str, str]],
+    user_refs: dict[str | None, Path],
+) -> dict[str, str]:
+    """Attach voice-matched clips and fold split labels, in place.
+
+    ``refs`` and ``segments`` are both rewritten, because everything downstream keys off
+    the speaker label: the review grouping decides which lines may be merged, the prompt
+    is told who is talking, and synthesis picks a voice per label. Folding a label in only
+    one of those places leaves a speaker whose lines are grouped as one person but spoken
+    as another — so the label is folded everywhere, or not at all.
+
+    Returns the fold that was applied, for the caller to put in its cache keys.
+    """
+    fold = _merge_fold(merges, {k for k in user_refs if k is not None})
+    if fold:
+        for seg in segments:
+            if seg.speaker in fold:
+                seg.speaker = fold[seg.speaker]
+    for speaker, clip in matched.items():
+        if speaker not in refs:
+            continue
+        samples, sr = read_mono(clip)
+        refs[speaker] = SpeakerRef(speaker, Path(clip).resolve(), len(samples) / sr, "matched")
+        log.info(f"{speaker}: reference replaced by the stored clip "
+                 f"({refs[speaker].duration:.1f}s)")
+    for label in fold:
+        if label in refs:
+            log.info(f"{label}: folded into {fold[label]} (same voice); its reference is "
+                     "no longer used")
+            del refs[label]
+    return fold
+
+
 def build_references(
     segments: list[Segment],
     audio_path: Path,
@@ -130,22 +193,32 @@ def build_references(
     target_seconds: float,
     min_seconds: float,
 ) -> dict[str | None, SpeakerRef]:
-    """One :class:`SpeakerRef` per speaker label in ``segments``."""
+    """One :class:`SpeakerRef` per speaker label in ``segments``.
+
+    A clip the caller named explicitly (``--ref SPK0=...``) always wins, because that is a
+    person stating what they want. Clips identified *by voice* are applied afterwards, by
+    :func:`apply_matches`, because identifying them requires these auto-cut references
+    first — comparing a stored clip against a pipeline cut separates the same two speakers
+    at 0.99 against 0.66, while comparing it against raw in-file audio puts them at 0.64
+    against 0.61 (see :mod:`ytdub.stages.voices`).
+    """
     refs: dict[str | None, SpeakerRef] = {}
+    supplied = dict(user_refs)
     speakers = sorted({s.speaker for s in segments}, key=lambda x: (x is None, x or ""))
     if None in user_refs and len(speakers) > 1:
         log.warning(f"--ref without a speaker label is ignored with {len(speakers)} speakers; "
                     f"use --ref SPK0=path (labels: {', '.join(map(str, speakers))})")
-    unknown = [k for k in user_refs if k is not None and k not in speakers]
+    unknown = [k for k in supplied if k is not None and k not in speakers]
     if unknown:
-        log.warning(f"--ref for unknown speaker(s) {unknown}; labels are {speakers}")
+        log.warning(f"reference for unknown speaker(s) {unknown}; labels are {speakers}")
     for spk in speakers:
         name = spk or "voice"
-        if spk in user_refs or (len(speakers) == 1 and None in user_refs):
-            path = user_refs.get(spk, user_refs.get(None))
+        if spk in supplied and (spk is not None or len(speakers) == 1):
+            path = supplied.get(spk, supplied.get(None))
             samples, sr = read_mono(path)
-            ref = SpeakerRef(spk, path, len(samples) / sr, "user")
-            log.info(f"{name}: using supplied reference {path} ({ref.duration:.1f}s)")
+            origin = "user"
+            ref = SpeakerRef(spk, Path(path), len(samples) / sr, origin)
+            log.info(f"{name}: using {origin} reference {path} ({ref.duration:.1f}s)")
         else:
             region = select_region(segments, spk, target_seconds=target_seconds,
                                    min_seconds=min_seconds)

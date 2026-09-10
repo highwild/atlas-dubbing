@@ -1,0 +1,26 @@
+# Translation hints: term = the way you want it translated.
+# One per line. Lines starting with # are ignored.
+#
+# The glossary is "never translate this" (channel names, games, brands).
+# This file is "translate this term this specific way" - domain vocabulary that
+# recurs across videos: burger review words, rail terms, in-game jargon.
+#
+#   patty = kotlet          (PL)   ->  in every language
+#
+# For one target language only, put the same pairs in a hints.<lang>.txt file
+# next to this one (e.g. hints.pl.txt, hints.de.txt). It wins over this file, so
+# a shared list can be corrected for one language without repeating it.
+#
+# Hints go into the translation prompt, so changing either file retranslates.
+# Removing a hint is a change too: delete the line, do not comment it out.
+
+# --- food / burger reviews (Polish) ---
+# patty = kotlet
+# taste buds = kubki smakowe
+# bun = bułka
+# craftsmanship = rzemiosło
+# patty = plaster mięsa        # the reference rendering for the last video
+
+# --- rail (Polish) ---
+# rolling stock = tabor
+# level crossing = przejazd kolejowy

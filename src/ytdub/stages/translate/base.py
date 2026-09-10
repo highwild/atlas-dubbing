@@ -14,7 +14,7 @@ from ytdub.plugins import load_class
 
 if TYPE_CHECKING:
     from ytdub.config import Settings
-    from ytdub.stages.translate.prompt import Line
+    from ytdub.stages.translate.prompt import Hint, Line
 
 BUILTIN = {"ollama": "ytdub.stages.translate.ollama:OllamaTranslator"}
 
@@ -33,6 +33,12 @@ class Translator(Protocol):
     def translate(self, lines: list[Line], *, source_lang: str,
                   target_lang: str) -> tuple[list[str], dict]:
         """One translation per line, in order, never fewer; plus a stats dict."""
+
+    def set_hints(self, hints: list[Hint]) -> None:
+        """Optional. Called with the target language's ``hints.txt`` pairs just before
+        that language is translated; a backend without this method is still valid and
+        simply logs that the hints were ignored. The same list is in the language's
+        cache key, so leaving this out cannot cause a stale cache hit."""
 
     def unload(self) -> None:
         """Free VRAM before synthesis. Called once, after all languages."""
