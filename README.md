@@ -22,6 +22,11 @@ dub2 myfile.wav --srt-only pl --verify      # check the translation before spend
 dub2                                        # usage + available styles
 ```
 
+Whisper's lines are cut on pauses as well as on punctuation, so they arrive as
+half-sentences; they are joined back into whole sentences once, after diarization and
+before translation, because every stage downstream handles a whole sentence better than a
+fragment (on `hydro.wav` that is 51 lines becoming 29). `--no-join-fragments` turns it off.
+
 Voices are counted by the diarizer by default, so a multi-speaker file needs no flags: each
 detected speaker gets their own reference clip and their own cloned voice. `--voice` (or
 `YTDUB_VOICE` in `.env`) attaches your own clip to whichever speaker sounds like you,
