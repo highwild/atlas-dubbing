@@ -142,13 +142,23 @@ def _usage(p: argparse.ArgumentParser, settings: Settings) -> None:
           "output/solo/pl.verify.txt")
 
 
-def _parse_refs(values: list[str]) -> dict[str | None, Path]:
+def _parse_refs(values: list[str], settings: Settings) -> dict[str | None, Path]:
+    """``--ref [SPK=]PATH``, with a relative PATH resolved from here or the project root.
+
+    The command is run from wherever the user happens to be, and a voice clip lives in the
+    project's ``voices/``; resolving only against the current directory turns
+    ``--ref SPK0=voices/atlas.wav`` into "not found" for anyone who has not cd'd there
+    first. The current directory still wins when both exist, so a local file can override
+    the project's.
+    """
     refs: dict[str | None, Path] = {}
     for v in values:
         spk, _, path = v.rpartition("=") if "=" in v else ("", "", v)
         p = Path(path).expanduser()
+        if not p.is_absolute() and not p.is_file():
+            p = settings.home / p
         if not p.is_file():
-            raise SystemExit(f"--ref: {p} not found")
+            raise SystemExit(f"--ref: {path} not found (looked in . and {settings.home})")
         refs[spk or None] = p.resolve()
     return refs
 
@@ -218,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Unsupported by the {settings.tts_backend} TTS: {', '.join(bad)}. "
                   f"Supported: {' '.join(sorted(supported))}")
             return 1
-    refs = _parse_refs(args.ref)
+    refs = _parse_refs(args.ref, settings)
     if args.detach:
         return _detach(argv, settings, args.input)
 

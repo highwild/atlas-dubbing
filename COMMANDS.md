@@ -101,7 +101,7 @@ the job starts, naming what is supported — no hours wasted before finding out.
 | `--speakers N` | `0` | `0` = count the voices with the diarizer (default), `1` = one speaker, `N` = force N. Multi-voice mode tags every line with its `SPK` label and gives each speaker their own cloned voice. |
 | `--no-join-fragments` | joined | Whisper splits on pauses as well as on punctuation, which leaves half-sentences; they are joined back into whole ones after diarization and before translation. This keeps the split lines instead. |
 | `--source LANG` | auto | source language; skip Whisper's detection when you know it |
-| `--ref [SPK=]PATH` | auto | voice reference clip, repeatable: `--ref atlas.wav` or `--ref SPK1=guest.wav`. Without it, a reference is cut from the input itself. |
+| `--ref [SPK=]PATH` | auto | voice reference clip, repeatable: `--ref voices/atlas.wav` or `--ref SPK1=guest.wav`. A relative path is looked for in the current directory and then in the project root, so it works from anywhere. Without it, a reference is cut from the input itself. |
 | `--voice PATH` | `YTDUB_VOICE` | **your own voice clip** (file or a folder of clips), matched to whichever speaker sounds like it — so the per-file `SPK` label never has to be named. A second label that also matches you is folded into the first. Also `YTDUB_VOICE`. |
 
 ### review loop

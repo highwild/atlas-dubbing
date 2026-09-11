@@ -417,6 +417,29 @@ def test_cli_flags_in_any_order(tmp_path, monkeypatch):
     assert s.style == "duo" and s.speakers == 2 and captured["srt_only"]
 
 
+def test_a_relative_ref_is_found_from_the_project_root_too(tmp_path, monkeypatch):
+    """`dub2 x.wav de --ref SPK0=voices/atlas.wav` is typed from wherever the user is,
+    and the clip lives in the project. Only looking in the current directory made that
+    "not found" for anyone who had not cd'd there."""
+    from ytdub import cli
+    from ytdub.config import Settings
+
+    home = _home(tmp_path)
+    (home / "voices").mkdir()
+    # A name that does not also exist in the working directory, or the current-directory
+    # rule would answer first and the fallback would go untested.
+    clip = home / "voices" / "test-only-clip.wav"
+    clip.write_bytes(b"x")
+    monkeypatch.setenv("YTDUB_HOME", str(home))
+    settings = Settings(_env_file=None, home=home)
+    assert cli._parse_refs(["SPK0=voices/test-only-clip.wav"],
+                           settings) == {"SPK0": clip.resolve()}
+    # An absolute path is still taken as given.
+    assert cli._parse_refs([f"SPK1={clip}"], settings) == {"SPK1": clip.resolve()}
+    with pytest.raises(SystemExit):
+        cli._parse_refs(["SPK0=voices/not-here-either.wav"], settings)
+
+
 def test_cli_rejects_unknown_style_and_language(tmp_path, monkeypatch):
     from ytdub import cli
 
